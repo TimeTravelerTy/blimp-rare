@@ -1,0 +1,40 @@
+sv_agreement:
+  phenomenon: sv_agreement
+  configs:
+    - regular_plural_subject_verb_agreement_1
+    - regular_plural_subject_verb_agreement_2
+    - irregular_plural_subject_verb_agreement_1
+    - irregular_plural_subject_verb_agreement_2
+
+det_n_agreement:
+  phenomenon: det_n_agreement
+  configs:
+    - determiner_noun_agreement_1
+    - determiner_noun_agreement_2
+    - determiner_noun_agreement_with_adjective_1
+    - determiner_noun_agreement_with_adj_2
+    - determiner_noun_agreement_irregular_1
+    - determiner_noun_agreement_irregular_2
+    - determiner_noun_agreement_with_adj_irregular_1
+    - determiner_noun_agreement_with_adj_irregular_2
+
+anaphor_agreement:
+  phenomenon: anaphor_agreement
+  configs:
+    - anaphor_gender_agreement
+    - anaphor_number_agreement
+    - principle_A_case_1
+    - principle_A_case_2
+    - principle_A_domain_1
+    - principle_A_domain_2
+    - principle_A_domain_3
+    - principle_A_c_command
+    - principle_A_reconstruction
+
+quantifiers:
+  phenomenon: quantifiers
+  configs:
+    - existential_there_quantifiers_1
+    - existential_there_quantifiers_2
+    - superlative_quantifiers_1
+    - superlative_quantifiers_2

@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.log
+*.sqlite3
+*.db
+*.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# Data & outputs
+*.jsonl
+*.tsv
+*.csv
+data/processed/
+data/external/
+data/raw/
+
+# OS
+.DS_Store
+
+# Environment
+.env
+venv/
+.envrc
+
+# Misc
+*.bak
+*.tmp
+*.swp
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
