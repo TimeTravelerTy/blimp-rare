@@ -27,6 +27,7 @@ _POS_ALIASES = {
 }
 
 _WORD_RE = re.compile(r"^[a-z]+$")
+_PERSON_SUFFIXES = ("ist", "er", "or", "phile", "ian", "man", "woman")
 
 
 class LemmaBankError(RuntimeError):
@@ -201,4 +202,6 @@ def is_person_noun(lemma: str, *, lexicon: str = _DEFAULT_LEXICON) -> bool:
     norm = (lemma or "").strip().lower()
     if not norm:
         return False
+    if any(norm.endswith(sfx) for sfx in _PERSON_SUFFIXES):
+        return True
     return _is_person_noun_cached(norm, lexicon)

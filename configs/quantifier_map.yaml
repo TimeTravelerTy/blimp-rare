@@ -1,2 +1,2 @@
-count_triggers: ["many", "few", "several", "both", "these", "those", "every", "each"]
+count_triggers: ["many", "few", "several", "both", "these", "those", "this", "that", "every", "each", "a", "an", "one", "two", "three", "four", "five"]
 mass_triggers: ["much", "little", "less"]

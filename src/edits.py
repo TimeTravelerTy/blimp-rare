@@ -8,11 +8,10 @@ from .inflect import (
     singularize_noun,
 )
 from .rarity import is_rare_lemma
-from .names import NameBank
 
 _PARTITIVE_HEADS = {"lot", "lots", "bunch", "number", "couple", "plenty"}
 _UPPER_SPECIAL = {"ii", "iii", "iv"}
-_ANIMATE_REFLEXIVES = {"himself", "herself", "themselves", "myself", "yourself", "yourselves", "ourselves"}
+_ANIMATE_REFLEXIVES = {"himself", "herself", "themselves"}
 _POOL_CACHE = {}
 
 _ABSTRACT_SUFFIXES = ("ness", "hood", "ship", "ism", "ity", "ment", "ance", "ence", "ency", "age", "is", "ia")
@@ -420,70 +419,3 @@ def noun_swap_all(
         text = text[0].upper() + text[1:]
     return text, swaps
 
-
-def person_name_candidates(doc, name_bank: NameBank):
-    """
-    Return a sorted list of (token, gender) pairs for person-name tokens that can be swapped.
-    """
-    candidates = []
-    for token in doc:
-        if token.pos_ != "PROPN":
-            continue
-        text = token.text.strip()
-        if not text or not text[0].isalpha():
-            continue
-        gender = name_bank.gender_for(text)
-        if gender is None:
-            continue
-        candidates.append((token, gender))
-    candidates.sort(key=lambda item: item[0].i)
-    return candidates
-
-
-def person_name_swap(
-    doc,
-    name_bank: NameBank,
-    rng: Optional[random.Random] = None,
-    forced_targets=None,
-):
-    """
-    Swap person names using the supplied NameBank. Returns (text, swaps).
-    forced_targets: optional iterable of (index, gender) to override detection.
-    """
-    if rng is None:
-        rng = random
-
-    toks = [t.text for t in doc]
-    swaps = []
-
-    if forced_targets is not None:
-        targets = []
-        seen = set()
-        for idx, gender in forced_targets:
-            if not isinstance(idx, int):
-                continue
-            if idx < 0 or idx >= len(doc):
-                continue
-            if idx in seen:
-                continue
-            token = doc[idx]
-            targets.append((token, gender))
-            seen.add(idx)
-    else:
-        targets = person_name_candidates(doc, name_bank)
-
-    if not targets:
-        return None, swaps
-
-    for token, gender in targets:
-        new_lower = name_bank.sample(gender, rng)
-        if not new_lower:
-            return None, swaps
-        form = _match_casing(token.text, new_lower)
-        toks[token.i] = form
-        swaps.append({"i": token.i, "old": token.text, "new": form, "gender": gender})
-
-    text = _detokenize(toks)
-    if text:
-        text = text[0].upper() + text[1:]
-    return text, swaps
