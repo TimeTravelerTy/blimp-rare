@@ -28,6 +28,8 @@ _POS_ALIASES = {
 
 _WORD_RE = re.compile(r"^[a-z]+$")
 _PERSON_SUFFIXES = ("ist", "er", "or", "phile", "ian", "man", "woman")
+_PERSON_DOMAIN = "noun.person"
+_LOCATION_DOMAIN = "noun.location"
 
 
 class LemmaBankError(RuntimeError):
@@ -153,46 +155,47 @@ def sample_rare_nouns_from_oewn(
 
 
 @lru_cache(maxsize=4096)
-def _is_person_noun_cached(lemma: str, lexicon: str) -> bool:
-    if not lemma:
+def _lemma_has_domain(lemma: str, lexicon: str, domain: str) -> bool:
+    if not lemma or not domain:
         return False
-    # Ensure the lexicon is available; re-use the loader cache.
     _load_lexicon(lexicon)
     try:
         synsets = wn.synsets(lemma, pos="n", lexicon=lexicon)
     except Exception:
         return False
-    for syn in synsets:
-        lex_domain = None
+
+    def _matches(syn) -> bool:
         try:
             lex_domain = syn.lexdomain()
         except AttributeError:
-            pass
-        if lex_domain is not None and getattr(lex_domain, "id", None) == "noun.person":
+            lex_domain = None
+        if lex_domain is not None and getattr(lex_domain, "id", None) == domain:
             return True
         try:
-            if syn.lexname() == "noun.person":
+            if syn.lexname() == domain:
                 return True
         except AttributeError:
             pass
+        return False
+
+    for syn in synsets:
+        if _matches(syn):
+            return True
         try:
             hypernyms = syn.hypernyms()
         except AttributeError:
             hypernyms = ()
         for hyper in hypernyms:
-            hyper_domain = None
-            try:
-                hyper_domain = hyper.lexdomain()
-            except AttributeError:
-                pass
-            if hyper_domain is not None and getattr(hyper_domain, "id", None) == "noun.person":
+            if _matches(hyper):
                 return True
-            try:
-                if hyper.lexname() == "noun.person":
-                    return True
-            except AttributeError:
-                continue
     return False
+
+
+@lru_cache(maxsize=4096)
+def _is_person_noun_cached(lemma: str, lexicon: str) -> bool:
+    if not lemma:
+        return False
+    return _lemma_has_domain(lemma, lexicon, _PERSON_DOMAIN)
 
 
 def is_person_noun(lemma: str, *, lexicon: str = _DEFAULT_LEXICON) -> bool:
@@ -205,3 +208,20 @@ def is_person_noun(lemma: str, *, lexicon: str = _DEFAULT_LEXICON) -> bool:
     if any(norm.endswith(sfx) for sfx in _PERSON_SUFFIXES):
         return True
     return _is_person_noun_cached(norm, lexicon)
+
+
+@lru_cache(maxsize=4096)
+def _is_location_noun_cached(lemma: str, lexicon: str) -> bool:
+    if not lemma:
+        return False
+    return _lemma_has_domain(lemma, lexicon, _LOCATION_DOMAIN)
+
+
+def is_location_noun(lemma: str, *, lexicon: str = _DEFAULT_LEXICON) -> bool:
+    """
+    Return True if WordNet marks the noun lemma as a location / place concept.
+    """
+    norm = (lemma or "").strip().lower()
+    if not norm:
+        return False
+    return _is_location_noun_cached(norm, lexicon)

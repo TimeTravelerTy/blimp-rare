@@ -60,10 +60,57 @@ _IRREGULAR_PLURALS = {
 _IRREGULAR_SINGULARS = {v: k for k, v in _IRREGULAR_PLURALS.items()}
 
 
+def _match_case(template: str, replacement: str) -> str:
+    if not template:
+        return replacement
+    if template.isupper():
+        return replacement.upper()
+    if template.istitle():
+        return replacement.title()
+    if template.islower():
+        return replacement.lower()
+    return replacement
+
+
+def _compound_person_plural(lower: str) -> Optional[str]:
+    if lower.endswith("woman") and len(lower) > len("woman"):
+        return lower[:-5] + "women"
+    if lower.endswith("man") and len(lower) > len("man"):
+        if lower.endswith("human"):
+            return None
+        return lower[:-3] + "men"
+    return None
+
+
+def _compound_person_singular(lower: str) -> Optional[str]:
+    if lower.endswith("women") and len(lower) > len("women"):
+        return lower[:-5] + "woman"
+    if lower.endswith("men") and len(lower) > len("men"):
+        candidate = lower[:-3] + "man"
+        if candidate.endswith("human"):
+            return None
+        return candidate
+    return None
+
+
 def inflect_noun(lemma, tag):
     # tag is "NN" or "NNS"
     out = getInflection(lemma, tag=tag)
-    return out[0] if out else None
+    form = out[0] if out else None
+    if not lemma:
+        return form
+    lower = lemma.lower()
+    if tag == "NNS":
+        compound = _compound_person_plural(lower)
+        if compound:
+            if not form or form.lower() != compound:
+                form = _match_case(lemma, compound)
+    if tag == "NN":
+        singular = _compound_person_singular(lower)
+        if singular:
+            if not form or form.lower() != singular:
+                form = _match_case(lemma, singular)
+    return form
 
 
 @lru_cache(maxsize=4096)
@@ -77,6 +124,9 @@ def pluralize_noun(lemma: str) -> Optional[str]:
     lower = base.lower()
     if lower in _IRREGULAR_PLURALS:
         return _IRREGULAR_PLURALS[lower]
+    compound = _compound_person_plural(lower)
+    if compound:
+        return compound
     forms = getInflection(lower, tag="NNS")
     if not forms:
         return None
@@ -94,6 +144,9 @@ def singularize_noun(form: str) -> Tuple[str, ...]:
     lower = word.lower()
     if lower in _IRREGULAR_SINGULARS:
         return (_IRREGULAR_SINGULARS[lower],)
+    compound = _compound_person_singular(lower)
+    if compound:
+        return (compound,)
     lemmas = getLemma(lower, upos="NOUN")
     if not lemmas:
         return tuple()

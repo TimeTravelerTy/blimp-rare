@@ -1,6 +1,6 @@
 import random
 from functools import lru_cache
-from typing import Optional
+from typing import Optional, Mapping, Set
 
 from .inflect import (
     inflect_noun,
@@ -12,6 +12,13 @@ from .rarity import is_rare_lemma
 _PARTITIVE_HEADS = {"lot", "lots", "bunch", "number", "couple", "plenty"}
 _UPPER_SPECIAL = {"ii", "iii", "iv"}
 _ANIMATE_REFLEXIVES = {"himself", "herself", "themselves"}
+_REFLEXIVE_GENDER = {
+    "himself": "M",
+    "herself": "F",
+    "themself": None,
+    "themselves": None,
+}
+_ARTICLE_DETERMINERS = {"a", "an", "the", "some"}
 _POOL_CACHE = {}
 
 _ABSTRACT_SUFFIXES = ("ness", "hood", "ship", "ism", "ity", "ment", "ance", "ence", "ency", "age", "is", "ia")
@@ -39,14 +46,20 @@ _SPECIAL_PLURALS = {
 _PLURAL_SUFFIXES = ("ches", "shes", "xes", "zes", "ses", "ies", "ves")
 
 
-def reflexive_subject_indices(doc):
+def reflexive_subject_indices(doc, *, with_gender: bool = False):
     """
     Return the token indices of nominal subjects that bind an animate reflexive.
+    When ``with_gender`` is True, also return a mapping from subject index to
+    the reflexive's grammatical gender (``\"M\"`` or ``\"F\"``). Neutral / unknown
+    reflexives are omitted from the mapping.
     """
     indices = set()
+    gender_map = {}
     for pron in doc:
-        if pron.pos_ != "PRON" or pron.lower_ not in _ANIMATE_REFLEXIVES:
+        lower = pron.lower_
+        if pron.pos_ != "PRON" or lower not in _ANIMATE_REFLEXIVES:
             continue
+        gender = _REFLEXIVE_GENDER.get(lower)
         heads = []
         head = pron.head
         if head is not None:
@@ -58,7 +71,22 @@ def reflexive_subject_indices(doc):
             for child in candidate_head.children:
                 if child.dep_ in {"nsubj", "nsubjpass"} and child.pos_ == "NOUN":
                     indices.add(child.i)
+                    if gender and with_gender:
+                        gender_map[child.i] = gender
+    if with_gender:
+        return indices, gender_map
     return indices
+
+
+def _matches_gender(lemma: str, required: Optional[str], gender_map: Optional[Mapping[str, Set[str]]]) -> bool:
+    if not required:
+        return True
+    if not gender_map:
+        return False
+    genders = gender_map.get(lemma)
+    if not genders:
+        return False
+    return required in genders or "N" in genders
 
 
 def _is_partitive_quantifier(token):
@@ -81,11 +109,29 @@ def _is_partitive_quantifier(token):
     return prev.lower_ in {"a", "an", "the", "this", "that", "these", "those"}
 
 
+def _has_preceding_article(token) -> bool:
+    if token.i == 0:
+        return False
+    doc = token.doc
+    if doc is None:
+        return False
+    prev = doc[token.i - 1]
+    if prev.lower_ in _ARTICLE_DETERMINERS:
+        return True
+    return prev.pos_ == "DET"
+
+
 def _is_properish(token):
     if "Prop" in token.morph.get("NounType"):
         return True
-    if token.text and token.text[0].isupper() and token.lemma_ == token.text:
-        return True
+    text = token.text
+    if not text:
+        return False
+    if text[0].isupper():
+        if token.lemma_ == text:
+            return True
+        if not _has_preceding_article(token):
+            return True
     return False
 
 
@@ -272,6 +318,7 @@ def noun_swap_all(
     forced_targets=None,
     rare_person_lemmas=None,
     override_lemmas=None,
+    person_gender_map: Optional[Mapping[str, Set[str]]] = None,
 ):
     """
     rare_lemmas: iterable[str] of candidate noun lemmas. If ``zipf_thr`` is None
@@ -288,13 +335,17 @@ def noun_swap_all(
     override_lemmas: optional iterable of lemma strings to use (in target order)
         instead of sampling from the rare pools. When provided, the function
         ignores ``rare_lemmas`` and ``rng`` for selection.
+    person_gender_map: optional mapping of lemma -> {"M","F","N"} genders. When
+        present, animate slots that specify a gender will only draw from lemmas
+        whose wiki-derived genders intersect the requirement (``"N"`` denotes a
+        neutral/unisex lemma that satisfies either requirement).
     """
     if rng is None:
         rng = random
 
     toks = [t.text for t in doc]
     swaps = []
-    reflexive_subjects = reflexive_subject_indices(doc)
+    reflexive_subjects, reflexive_genders = reflexive_subject_indices(doc, with_gender=True)
 
     if forced_targets is not None:
         seen = set()
@@ -320,9 +371,14 @@ def noun_swap_all(
                 continue
             token = doc[idx]
             forced_tag = tag or token.tag_
+            require_gender = None
             if require_person is None:
                 require_person = idx in reflexive_subjects
-            targets.append((token, forced_tag, bool(require_person)))
+            if "require_gender" in entry:
+                require_gender = entry.get("require_gender")
+            if require_gender is None:
+                require_gender = reflexive_genders.get(idx)
+            targets.append((token, forced_tag, bool(require_person), require_gender))
             seen.add(idx)
     else:
         detected = candidate_nouns(doc)
@@ -331,7 +387,7 @@ def noun_swap_all(
         if noun_mode == "k":
             limit = max(0, min(k, len(detected)))
             detected = detected[:limit]
-        targets = [(t, t.tag_, t.i in reflexive_subjects) for t in detected]
+        targets = [(t, t.tag_, t.i in reflexive_subjects, reflexive_genders.get(t.i)) for t in detected]
 
     if not targets:
         return None, swaps
@@ -351,7 +407,7 @@ def noun_swap_all(
             return None, []
         if not override_list:
             return None, []
-        for (token, tag, _), lemma in zip(targets, override_list):
+        for (token, tag, _, _), lemma in zip(targets, override_list):
             if not lemma or not isinstance(lemma, str):
                 return None, []
             form = inflect_noun(lemma, tag)
@@ -388,14 +444,27 @@ def noun_swap_all(
         pool_set = set(pool)
         pool_person = [w for w in pool_person if w in pool_set]
 
-        if any(require_person for _, _, require_person in targets) and not pool_person:
+        person_set = set(pool_person)
+        pool_non_person = [w for w in pool if w not in person_set]
+
+        needs_person = any(require_person for _, _, require_person, _ in targets)
+        needs_non_person = any(not require_person for _, _, require_person, _ in targets)
+
+        if needs_person and not pool_person:
+            return None, []
+        if needs_non_person and not pool_non_person:
             return None, []
 
         # Choose in a deterministic sequence using rng
-        for token, tag, require_person in targets:
-            choice_pool = pool_person if require_person else pool
+        for token, tag, require_person, require_gender in targets:
+            choice_pool = pool_person if require_person else pool_non_person
             if not choice_pool:
                 return None, []
+            if require_gender:
+                filtered = [lemma for lemma in choice_pool if _matches_gender(lemma, require_gender, person_gender_map)]
+                if not filtered:
+                    return None, []
+                choice_pool = filtered
             lemma = rng.choice(choice_pool)
             form = inflect_noun(lemma, tag)
             if not form:
@@ -418,4 +487,3 @@ def noun_swap_all(
     if text:
         text = text[0].upper() + text[1:]
     return text, swaps
-
