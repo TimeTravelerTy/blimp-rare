@@ -40,6 +40,9 @@ _SPECIAL_PLURALS = {
     "data",
     "media",
     "dice",
+    "cacti",
+    "octopi",
+    "alumni",
 }
 _PLURAL_SUFFIXES = ("ches", "shes", "xes", "zes", "ses", "ies", "ves")
 

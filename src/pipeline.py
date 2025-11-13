@@ -235,6 +235,8 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                         continue
                     require_gender = _required_gender(g_tok, g_reflexive_subjects, gender_lex)
                     require_person = (g_tok.i in g_reflexive_subjects) or bool(require_gender)
+                    if not require_person and is_person_noun(g_tok.lemma_.lower()):
+                        require_person = True
                     noun_matches.append(
                         (
                             (g_tok.i, _noun_target_tag(g_tok)),
