@@ -23,6 +23,7 @@ if __name__ == "__main__":
     ap.add_argument("--rare_name_path", default="data/external/rare_names.tsv")
     ap.add_argument("--name_lookup_path", default="data/external/name_gender_lookup.tsv")
     ap.add_argument("--name_conf", type=float, default=0.75)
+    ap.add_argument("--gender_lexicon", default="data/processed/wiktionary_gender_lemmas.json")
     args = ap.parse_args()
 
     rare = json.loads(args.rare_lemmas) if args.rare_lemmas else []
@@ -44,4 +45,5 @@ if __name__ == "__main__":
                 rare_lemmas=rare, seed=args.seed,
                 rare_name_path=args.rare_name_path,
                 name_lookup_path=args.name_lookup_path,
-                name_conf=args.name_conf)
+                name_conf=args.name_conf,
+                gender_lexicon_path=args.gender_lexicon)
