@@ -1,4 +1,4 @@
-import random, spacy, yaml, time, sys
+import random, spacy, yaml, time
 from pathlib import Path
 from .io import load_blimp, write_jsonl
 from .becl import load_becl_tsv
@@ -10,7 +10,6 @@ from .edits import (
 )
 from .rarity import is_rare_lemma
 from .lemma_bank import is_person_noun, is_location_noun
-from .wiki_gender import load_wiki_person_genders
 
 
 def _format_duration(seconds):
@@ -81,8 +80,7 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                 show_progress=True,
                 rare_name_path="data/external/rare_names.tsv",
                 name_lookup_path="data/external/name_gender_lookup.tsv",
-                name_conf=0.75,
-                person_gender_path="data/external/wiki_person_genders.tsv"):
+                name_conf=0.75):
     base_rng = random.Random(seed)
     nlp = spacy.load("en_core_web_sm")
     with open(tier_cfg_path, encoding="utf-8") as f:
@@ -112,25 +110,10 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
     else:
         rare_pool = tuple()
 
-    gender_lookup = {}
-    if person_gender_path:
-        try:
-            gender_lookup = load_wiki_person_genders(person_gender_path)
-            if gender_lookup:
-                print(f"[Gender] Loaded {len(gender_lookup)} wiki person gender entries from {person_gender_path}.")
-            else:
-                print(f"[Gender] No entries found in {person_gender_path}; gender matching disabled.", file=sys.stderr)
-        except FileNotFoundError:
-            print(f"[Gender] Missing file {person_gender_path}; gender matching disabled.", file=sys.stderr)
-
     if rare_pool:
         rare_person_pool = tuple(lemma for lemma in rare_pool if is_person_noun(lemma))
     else:
         rare_person_pool = tuple()
-    if rare_person_pool and gender_lookup:
-        rare_person_gender = {lemma: gender_lookup[lemma] for lemma in rare_person_pool if lemma in gender_lookup}
-    else:
-        rare_person_gender = {}
 
     worklist = []
     total_items = 0
@@ -154,7 +137,8 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
         for i, r in enumerate(ds):
                 g, b = r["sentence_good"], r["sentence_bad"]
                 gdoc, bdoc = nlp(g), nlp(b)
-                g_reflexive_subjects, g_reflexive_genders = reflexive_subject_indices(gdoc, with_gender=True)
+                g_reflexive_subjects = reflexive_subject_indices(gdoc)
+                b_reflexive_subjects = reflexive_subject_indices(bdoc)
 
                 # Quantifier requirement per sentence
                 req_g = requirement(gdoc, qrules)  # None/COUNT/MASS
@@ -197,13 +181,11 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                     if b_match is None:
                         continue
                     require_person = g_tok.i in g_reflexive_subjects
-                    require_gender = g_reflexive_genders.get(g_tok.i)
                     noun_matches.append(
                         (
                             (g_tok.i, _noun_target_tag(g_tok)),
                             (b_match.i, _noun_target_tag(b_match)),
                             require_person,
-                            require_gender,
                         )
                     )
                     used_bad_indices.add(b_match.i)
@@ -227,20 +209,18 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                         shared_req = "COUNT"
                     g_target_specs = []
                     b_target_specs = []
-                    for g_spec, b_spec, require_person, require_gender in noun_matches:
+                    for g_spec, b_spec, require_person in noun_matches:
                         g_idx, g_tag = g_spec
                         b_idx, b_tag = b_spec
                         g_target_specs.append({
                             "i": g_idx,
                             "tag": g_tag,
                             "require_person": require_person,
-                            "require_gender": require_gender,
                         })
                         b_target_specs.append({
                             "i": b_idx,
                             "tag": b_tag,
                             "require_person": require_person,
-                            "require_gender": require_gender,
                         })
                     rng = random.Random(pair_seed)
                     g_rare, g_swaps = noun_swap_all(
@@ -248,8 +228,7 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                         noun_mode=noun_mode, k=k, zipf_thr=None,
                         becl_map=becl_map, req=shared_req, rng=rng,
                         forced_targets=g_target_specs,
-                        rare_person_lemmas=rare_person_pool,
-                        person_gender_map=rare_person_gender,
+                        rare_person_lemmas=rare_person_pool
                     )
                     b_rare = None
                     if g_rare and g_swaps:
@@ -263,7 +242,6 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                 forced_targets=b_target_specs,
                                 rare_person_lemmas=rare_person_pool,
                                 override_lemmas=lemmas,
-                                person_gender_map=rare_person_gender,
                             )
                     if not (
                         g_rare
