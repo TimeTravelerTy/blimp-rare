@@ -320,7 +320,7 @@ def candidate_nouns(doc):
         and not any(child.dep_ in {"nsubj", "nsubjpass"} for child in t.children)  # avoid verb heads mis-tagged as nouns
         and not (t.head == t and t.dep_ == "ROOT")  # extra guard: skip if token is its own head and ROOT
         and not _is_partitive_quantifier(t)
-        and not (_is_properish(t) and not _looks_like_common_plural(t))
+        and not (_is_properish(t) and not (_looks_like_common_plural(t) or _force_pluralish(t)))
         and (t.i in noun_chunk_indices or t.i in subject_indices)
     ]
 
