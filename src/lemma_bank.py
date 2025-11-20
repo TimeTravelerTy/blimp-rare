@@ -1,3 +1,4 @@
+import random
 import re
 from functools import lru_cache
 from typing import List, Optional, Sequence
@@ -122,6 +123,8 @@ def sample_rare_lemmas_from_oewn(
     min_length: int = 3,
     lexicon: str = _DEFAULT_LEXICON,
     limit: Optional[int] = None,
+    shuffle: bool = False,
+    seed: int = 0,
 ) -> List[str]:
     """
     Collect rare lemmas from OEWN filtered by Zipf frequency.
@@ -154,6 +157,9 @@ def sample_rare_lemmas_from_oewn(
         if zipf_min is not None and score < zipf_min:
             continue
         rare.append(lemma)
+    if shuffle:
+        rng = random.Random(seed)
+        rng.shuffle(rare)
     if limit is not None:
         rare = rare[:max(0, limit)]
     return rare
@@ -166,6 +172,8 @@ def sample_rare_nouns_from_oewn(
     min_length: int = 3,
     lexicon: str = _DEFAULT_LEXICON,
     limit: Optional[int] = None,
+    shuffle: bool = False,
+    seed: int = 0,
 ) -> List[str]:
     """
     Backwards-compatible wrapper for sampling rare noun lemmas.
@@ -177,6 +185,8 @@ def sample_rare_nouns_from_oewn(
         min_length=min_length,
         lexicon=lexicon,
         limit=limit,
+        shuffle=shuffle,
+        seed=seed,
     )
 
 
@@ -187,6 +197,8 @@ def sample_rare_adjectives_from_oewn(
     min_length: int = 3,
     lexicon: str = _DEFAULT_LEXICON,
     limit: Optional[int] = None,
+    shuffle: bool = False,
+    seed: int = 0,
 ) -> List[str]:
     """
     Convenience wrapper for sampling rare adjective lemmas.
@@ -198,6 +210,33 @@ def sample_rare_adjectives_from_oewn(
         min_length=min_length,
         lexicon=lexicon,
         limit=limit,
+        shuffle=shuffle,
+        seed=seed,
+    )
+
+
+def sample_rare_verbs_from_oewn(
+    zipf_max: float = 3.4,
+    *,
+    zipf_min: Optional[float] = None,
+    min_length: int = 3,
+    lexicon: str = _DEFAULT_LEXICON,
+    limit: Optional[int] = None,
+    shuffle: bool = False,
+    seed: int = 0,
+) -> List[str]:
+    """
+    Convenience wrapper for sampling rare verb lemmas.
+    """
+    return sample_rare_lemmas_from_oewn(
+        "v",
+        zipf_max=zipf_max,
+        zipf_min=zipf_min,
+        min_length=min_length,
+        lexicon=lexicon,
+        limit=limit,
+        shuffle=shuffle,
+        seed=seed,
     )
 
 

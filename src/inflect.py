@@ -125,6 +125,18 @@ def inflect_adjective(lemma: str, tag: str):
     return out[0]
 
 
+def inflect_verb(lemma: str, tag: str):
+    """
+    Inflect a verb lemma for POS tags like VB/VBD/VBG/VBN/VBP/VBZ.
+    """
+    if not lemma or not tag:
+        return None
+    out = getInflection(lemma, tag=tag)
+    if not out:
+        return None
+    return out[0]
+
+
 @lru_cache(maxsize=4096)
 def pluralize_noun(lemma: str) -> Optional[str]:
     """Return a lower-cased plural form for the given lemma, if possible."""

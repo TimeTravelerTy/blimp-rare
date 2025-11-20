@@ -1,3 +1,4 @@
+import itertools
 import random, spacy, yaml, time
 from pathlib import Path
 from .io import load_blimp, write_jsonl
@@ -8,11 +9,14 @@ from .edits import (
     noun_swap_all,
     candidate_adjectives,
     candidate_nouns,
+    candidate_verbs,
     reflexive_subject_indices,
+    verb_swap_all,
 )
 from .rarity import is_rare_lemma
 from .lemma_bank import is_person_noun, is_location_noun
 from .gender_lexicon import load_gender_lexicon
+from .verb_inventory import VerbInventory, load_verb_inventory
 
 
 def _format_duration(seconds):
@@ -143,19 +147,26 @@ def _normalize_swap_targets(targets):
             out.add("nouns")
         elif lower in {"adj", "adjective", "adjectives"}:
             out.add("adjectives")
+        elif lower in {"verb", "verbs"}:
+            out.add("verbs")
         elif lower in {"both", "all"}:
-            out.update({"nouns", "adjectives"})
+            out.update({"nouns", "adjectives", "verbs"})
     return out
 
 
 def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                 noun_mode="all", k=2, zipf_thr=3.4, rare_lemmas=None,
                 adj_mode="all", adj_zipf_thr=3.4, rare_adj_lemmas=None,
+                verb_mode="k", verb_zipf_thr=3.4, rare_verb_lemmas=None,
                 swap_targets=("nouns",), seed=0, show_progress=True,
                 rare_name_path="data/external/rare_names.tsv",
                 name_lookup_path="data/external/name_gender_lookup.tsv",
                 name_conf=0.75,
-                gender_lexicon_path="data/processed/wiktionary_gender_lemmas.json"):
+                gender_lexicon_path="data/processed/wiktionary_gender_lemmas.json",
+                verb_inventory_path=None,
+                verb_inventory=None,
+                spacy_n_process: int = 1,
+                spacy_batch_size: int = 128):
     nlp = spacy.load("en_core_web_sm")
     with open(tier_cfg_path, encoding="utf-8") as f:
         tasks_cfg = yaml.safe_load(f)
@@ -169,6 +180,26 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
         swap_targets_set = {"nouns"}
     do_noun_swaps = "nouns" in swap_targets_set
     do_adj_swaps = "adjectives" in swap_targets_set
+    do_verb_swaps = "verbs" in swap_targets_set
+
+    verb_inventory_obj = verb_inventory
+    if verb_inventory_obj is None and verb_inventory_path:
+        try:
+            verb_inventory_obj = load_verb_inventory(verb_inventory_path)
+        except FileNotFoundError:
+            verb_inventory_obj = VerbInventory(tuple())
+
+    if do_verb_swaps:
+        if verb_inventory_obj is None:
+            do_verb_swaps = False
+        else:
+            if rare_verb_lemmas:
+                verb_inventory_obj = verb_inventory_obj.restrict_to(rare_verb_lemmas)
+            verb_inventory_obj = verb_inventory_obj.filter_by_zipf(verb_zipf_thr)
+            if verb_inventory_obj.is_empty():
+                do_verb_swaps = False
+    else:
+        verb_inventory_obj = None
 
     if do_noun_swaps:
         pool = _prepare_lemma_pool(rare_lemmas, zipf_thr)
@@ -238,15 +269,25 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
     last_update = start_time
 
     for group_name, phenomenon, cfg, ds in worklist:
+        # Parse all good/bad sentences for this subtask in batches to reduce
+        # spaCy overhead and allow multi-process parsing.
+        flat_texts = list(itertools.chain.from_iterable(
+            (r["sentence_good"], r["sentence_bad"]) for r in ds
+        ))
+        docs_flat = list(nlp.pipe(flat_texts, batch_size=spacy_batch_size, n_process=spacy_n_process))
+
         for i, r in enumerate(ds):
                 g, b = r["sentence_good"], r["sentence_bad"]
-                gdoc, bdoc = nlp(g), nlp(b)
-                g_reflexive_subjects = reflexive_subject_indices(gdoc)
-                b_reflexive_subjects = reflexive_subject_indices(bdoc)
+                gdoc_orig = docs_flat[2 * i]
+                bdoc_orig = docs_flat[2 * i + 1]
+                gdoc_working = gdoc_orig
+                bdoc_working = bdoc_orig
+                g_reflexive_subjects = reflexive_subject_indices(gdoc_orig)
+                b_reflexive_subjects = reflexive_subject_indices(bdoc_orig)
 
                 # Quantifier requirement per sentence
-                req_g = requirement(gdoc, qrules)  # None/COUNT/MASS
-                req_b = requirement(bdoc, qrules)
+                req_g = requirement(gdoc_orig, qrules)  # None/COUNT/MASS
+                req_b = requirement(bdoc_orig, qrules)
                 if phenomenon == "quantifiers":
                     if req_g is None and req_b in {"COUNT", "MASS"}:
                         req_g = req_b
@@ -258,16 +299,124 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
 
                 g_swaps, b_swaps = [], []
                 g_adj_swaps, b_adj_swaps = [], []
+                g_verb_swaps, b_verb_swaps = [], []
                 g_variant = g
                 b_variant = b
+                verb_changed = False
                 noun_changed = False
                 adj_changed = False
 
+                # Stage 0: verb swaps
+                if do_verb_swaps:
+                    g_verb_candidates = candidate_verbs(gdoc_working)
+                    g_verb_candidates.sort(key=lambda t: t.token.i)
+                    b_verb_candidates = candidate_verbs(bdoc_working)
+                    b_verb_candidates.sort(key=lambda t: t.token.i)
+
+                    verb_matches = []
+                    used_bad_verbs = set()
+
+                    def _match_verb(g_target):
+                        for b_target in b_verb_candidates:
+                            if b_target.token.i in used_bad_verbs:
+                                continue
+                            if b_target.lemma == g_target.lemma:
+                                return b_target
+                        for b_target in b_verb_candidates:
+                            if b_target.token.i in used_bad_verbs:
+                                continue
+                            if b_target.token.text.lower() == g_target.token.text.lower():
+                                return b_target
+                        return None
+
+                    for g_target in g_verb_candidates:
+                        b_match = _match_verb(g_target)
+                        if b_match is None:
+                            continue
+                        verb_matches.append((
+                            {
+                                "i": g_target.token.i,
+                                "tag": g_target.tag,
+                                "frame": g_target.frame_kind,
+                                "prep_i": g_target.prep_token.i if g_target.prep_token is not None else None,
+                                "particle_i": g_target.particle_token.i if g_target.particle_token is not None else None,
+                                "that_clause": g_target.has_that_clause,
+                            },
+                            {
+                                "i": b_match.token.i,
+                                "tag": b_match.tag,
+                                "frame": b_match.frame_kind,
+                                "prep_i": b_match.prep_token.i if b_match.prep_token is not None else None,
+                                "particle_i": b_match.particle_token.i if b_match.particle_token is not None else None,
+                                "that_clause": b_match.has_that_clause,
+                            }
+                        ))
+                        used_bad_verbs.add(b_match.token.i)
+
+                    if verb_mode == "k" and verb_matches:
+                        limit = max(0, min(k, len(verb_matches)))
+                        verb_matches = verb_matches[:limit]
+
+                    if verb_matches:
+                        g_target_specs = []
+                        b_target_specs = []
+                        for g_spec, b_spec in verb_matches:
+                            g_entry = dict(g_spec)
+                            b_entry = dict(b_spec)
+                            g_entry["that_clause"] = bool(g_spec.get("that_clause"))
+                            b_entry["that_clause"] = bool(b_spec.get("that_clause"))
+                            g_target_specs.append(g_entry)
+                            b_target_specs.append(b_entry)
+                        rng_verbs = random.Random(pair_seed - 1)
+                        g_verb_variant, g_verb_swaps = verb_swap_all(
+                            gdoc_working,
+                            verb_inventory_obj,
+                            verb_mode=verb_mode,
+                            k=k,
+                            rng=rng_verbs,
+                            forced_targets=g_target_specs,
+                        )
+                        b_verb_variant = None
+                        if g_verb_variant and g_verb_swaps:
+                            override_specs = []
+                            for entry in g_verb_swaps:
+                                lemma = entry.get("lemma")
+                                frame_name = entry.get("frame")
+                                if not lemma or not frame_name:
+                                    override_specs = []
+                                    break
+                                override_specs.append({"lemma": lemma, "frame": frame_name})
+                            if override_specs and len(override_specs) == len(b_target_specs):
+                                b_verb_variant, b_verb_swaps = verb_swap_all(
+                                    bdoc_working,
+                                    verb_inventory_obj,
+                                    verb_mode=verb_mode,
+                                    k=k,
+                                    rng=random.Random(pair_seed - 1),
+                                    forced_targets=b_target_specs,
+                                    override_specs=override_specs,
+                                )
+                        if not (
+                            g_verb_variant
+                            and b_verb_variant
+                            and g_verb_swaps
+                            and b_verb_swaps
+                            and len(g_verb_swaps) == len(b_verb_swaps)
+                        ):
+                            g_verb_swaps = []
+                            b_verb_swaps = []
+                        else:
+                            g_variant = g_verb_variant
+                            b_variant = b_verb_variant
+                            verb_changed = True
+                            gdoc_working = nlp(g_variant)
+                            bdoc_working = nlp(b_variant)
+
                 # Stage 1: noun swaps
                 if do_noun_swaps:
-                    g_candidates = candidate_nouns(gdoc)
+                    g_candidates = candidate_nouns(gdoc_working)
                     g_candidates.sort(key=lambda t: t.i)
-                    b_candidates = candidate_nouns(bdoc)
+                    b_candidates = candidate_nouns(bdoc_working)
                     b_candidates.sort(key=lambda t: t.i)
 
                     noun_matches = []
@@ -337,7 +486,7 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                             })
                         rng = random.Random(pair_seed)
                         g_rare, g_swaps = noun_swap_all(
-                            gdoc, rare_pool,
+                            gdoc_working, rare_pool,
                             noun_mode=noun_mode, k=k, zipf_thr=None,
                             becl_map=becl_map, req=shared_req, rng=rng,
                             forced_targets=g_target_specs,
@@ -349,7 +498,7 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                             lemmas = [entry.get("lemma") for entry in g_swaps]
                             if lemmas and all(lemma for lemma in lemmas):
                                 b_rare, b_swaps = noun_swap_all(
-                                    bdoc, rare_pool,
+                                    bdoc_working, rare_pool,
                                     noun_mode=noun_mode, k=k, zipf_thr=None,
                                     becl_map=becl_map, req=shared_req,
                                     rng=random.Random(pair_seed),
@@ -373,6 +522,8 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                             g_variant = g_rare
                             b_variant = b_rare
                             noun_changed = True
+                            gdoc_working = nlp(g_variant)
+                            bdoc_working = nlp(b_variant)
 
                 # Stage 2: adjective swaps (operates on the noun-swapped text)
                 if do_adj_swaps:
@@ -381,9 +532,9 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                     # Detect adjective targets on the original parse so noun swaps
                     # that confuse POS tagging (e.g., rare nouns tagged as PROPN)
                     # don't block adjective swaps.
-                    g_adj_candidates = candidate_adjectives(gdoc)
+                    g_adj_candidates = candidate_adjectives(gdoc_orig)
                     g_adj_candidates.sort(key=lambda t: t.i)
-                    b_adj_candidates = candidate_adjectives(bdoc)
+                    b_adj_candidates = candidate_adjectives(bdoc_orig)
                     b_adj_candidates.sort(key=lambda t: t.i)
 
                     adj_matches = []
@@ -461,7 +612,7 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                             b_variant = b_adj_variant
                             adj_changed = True
 
-                if not (noun_changed or adj_changed):
+                if not (verb_changed or noun_changed or adj_changed):
                     good_rare_val = None
                     bad_rare_val = None
                 else:
@@ -478,6 +629,8 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                     "good_rare": good_rare_val,
                     "bad_rare":  bad_rare_val,
                     "meta": {
+                        "g_verb_swaps": g_verb_swaps,
+                        "b_verb_swaps": b_verb_swaps,
                         "g_swaps": g_swaps,
                         "b_swaps": b_swaps,
                         "g_adj_swaps": g_adj_swaps,
@@ -485,9 +638,12 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                         "swap_targets": sorted(swap_targets_set),
                         "noun_mode": noun_mode,
                         "adj_mode": adj_mode,
+                        "verb_mode": verb_mode,
                         "k": k,
                         "zipf_thr": zipf_thr,
                         "adj_zipf_thr": adj_zipf_thr,
+                        "verb_zipf_thr": verb_zipf_thr,
+                        "verb_swapped": verb_changed,
                         "noun_swapped": noun_changed,
                         "adj_swapped": adj_changed,
                         "req_good": req_g,
