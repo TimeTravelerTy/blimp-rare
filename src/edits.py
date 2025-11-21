@@ -58,6 +58,13 @@ _IOBJ_DEPS = {"iobj", "dative"}
 _PREP_DEPS = {"prep"}
 _PARTICLE_DEPS = {"prt"}
 
+# Allow compatible frame backoffs when exact matching fails.
+_FRAME_FAMILY = {
+    "intr": ["trans"],               # intransitive verbs can align with simple transitives
+    "intr_pp": ["trans_pp"],         # PP-taking verbs with no object can align to transitive+PP frames
+    "intr_particle": ["trans_particle"],
+    "trans_pp": ["intr_pp"],         # sometimes inventory marks PP complements as intransitive
+}
 
 def reflexive_subject_indices(doc):
     """
@@ -81,7 +88,7 @@ def reflexive_subject_indices(doc):
                 heads.append(parent)
         for candidate_head in heads:
             for child in candidate_head.children:
-                if child.dep_ in {"nsubj", "nsubjpass"} and child.pos_ == "NOUN":
+                if child.dep_ in {"nsubj", "nsubjpass"} and child.pos_ in {"NOUN", "PROPN"}:
                     indices[child.i] = {
                         "pronoun": pron.text,
                         "gender": _REFLEXIVE_GENDER.get(lower),
@@ -312,26 +319,38 @@ def candidate_nouns(doc):
         for token in chunk:
             noun_chunk_indices.add(token.i)
     subject_indices = {t.i for t in doc if t.dep_ in {"nsubj", "nsubjpass"}}
-    # Only content nouns; skip PROPN, NE chunks, and ROOT (prevents verb mis-swaps like "reference")
-    return [
-        t for t in doc
-        if (
+    reflexive_subjects = reflexive_subject_indices(doc)
+
+    candidates = []
+    for t in doc:
+        is_reflexive_subject = t.i in reflexive_subjects
+        if not (
             (t.pos_ == "NOUN" and t.tag_ in {"NN", "NNS"})
-            or (t.pos_ == "PROPN" and _looks_like_common_plural(t))
             or _force_pluralish(t)
-        )
-        and t.is_alpha
-        and len(t.text) > 2
-        and t.ent_type_ == ""
-        and t.dep_ != "ROOT"  # skip main verb even if mis-tagged
-        and t.dep_ != "relcl"
-        and t.lemma_.lower() not in _NOUN_FALSE_FRIENDS
-        and not any(child.dep_ in {"nsubj", "nsubjpass"} for child in t.children)  # avoid verb heads mis-tagged as nouns
-        and not (t.head == t and t.dep_ == "ROOT")  # extra guard: skip if token is its own head and ROOT
-        and not _is_partitive_quantifier(t)
-        and not (_is_properish(t) and not (_looks_like_common_plural(t) or _force_pluralish(t)))
-        and (t.i in noun_chunk_indices or t.i in subject_indices)
-    ]
+        ):
+            continue
+        if not t.is_alpha or len(t.text) <= 2:
+            continue
+        if t.ent_type_:
+            continue
+        if t.dep_ == "ROOT" or t.dep_ == "relcl":
+            continue
+        if t.lemma_.lower() in _NOUN_FALSE_FRIENDS:
+            continue
+        # Avoid verb heads mis-tagged as nouns
+        if any(child.dep_ in {"nsubj", "nsubjpass"} for child in t.children):
+            continue
+        if t.head == t and t.dep_ == "ROOT":
+            continue
+        if _is_partitive_quantifier(t):
+            continue
+        if _is_properish(t) and not (_looks_like_common_plural(t) or _force_pluralish(t)):
+            continue
+        if not (t.i in noun_chunk_indices or t.i in subject_indices or is_reflexive_subject):
+            continue
+        candidates.append(t)
+
+    return candidates
 
 
 def candidate_adjectives(doc):
@@ -430,7 +449,13 @@ def candidate_verbs(doc):
         return False
 
     for token in doc:
-        if token.pos_ != "VERB":
+        is_verbish = token.pos_ == "VERB" or (
+            # spaCy sometimes tags cleft/relative-clause verbs as NOUN (NN/NNS).
+            token.pos_ == "NOUN"
+            and token.tag_ in {"NN", "NNS"}
+            and token.dep_ in {"ccomp", "xcomp", "advcl", "relcl", "ROOT"}
+        )
+        if not is_verbish:
             continue
         if token.dep_ in _VERB_AUX_DEPS:
             continue
@@ -454,7 +479,9 @@ def candidate_verbs(doc):
             particle_token=particle,
             has_that_clause=_has_that_complement(token),
         ))
+
     return candidates
+
 
 def noun_swap_all(
     doc,
@@ -943,12 +970,19 @@ def verb_swap_all(
         else:
             prep_text = target.prep_token.text if target.prep_token is not None else None
             particle_text = target.particle_token.text if target.particle_token is not None else None
-            sample = inventory.sample(
-                target.frame_kind,
-                rng,
-                desired_prep=prep_text,
-                desired_particle=particle_text,
-            )
+            frame_order = [target.frame_kind] + _FRAME_FAMILY.get(target.frame_kind, [])
+            sample = None
+            for fk in frame_order:
+                sample = inventory.sample(
+                    fk,
+                    rng,
+                    desired_prep=prep_text,
+                    desired_particle=particle_text,
+                )
+                if not sample and (prep_text or particle_text):
+                    sample = inventory.sample(fk, rng)
+                if sample:
+                    break
             if not sample:
                 return None, []
             entry, frame = sample
