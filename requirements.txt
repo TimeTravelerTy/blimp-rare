@@ -7,3 +7,5 @@ wn
 ucimlrepo
 pandas
 nltk
+torch
+transformers
