@@ -1,4 +1,3 @@
-import itertools
 import random, spacy, yaml, time
 from pathlib import Path
 from .io import load_blimp, write_jsonl
@@ -271,15 +270,17 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
     for group_name, phenomenon, cfg, ds in worklist:
         # Parse all good/bad sentences for this subtask in batches to reduce
         # spaCy overhead and allow multi-process parsing.
-        flat_texts = list(itertools.chain.from_iterable(
-            (r["sentence_good"], r["sentence_bad"]) for r in ds
-        ))
-        docs_flat = list(nlp.pipe(flat_texts, batch_size=spacy_batch_size, n_process=spacy_n_process))
+        def _iter_good_bad(dataset):
+            for record in dataset:
+                yield record["sentence_good"]
+                yield record["sentence_bad"]
+
+        docs_iter = nlp.pipe(_iter_good_bad(ds), batch_size=spacy_batch_size, n_process=spacy_n_process)
 
         for i, r in enumerate(ds):
                 g, b = r["sentence_good"], r["sentence_bad"]
-                gdoc_orig = docs_flat[2 * i]
-                bdoc_orig = docs_flat[2 * i + 1]
+                gdoc_orig = next(docs_iter)
+                bdoc_orig = next(docs_iter)
                 gdoc_working = gdoc_orig
                 bdoc_working = bdoc_orig
                 g_reflexive_subjects = reflexive_subject_indices(gdoc_orig)
@@ -414,9 +415,14 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
 
                 # Stage 1: noun swaps
                 if do_noun_swaps:
-                    g_candidates = candidate_nouns(gdoc_working)
+                    # Detect noun targets on the original parse so earlier swaps
+                    # (e.g., verbs) don't change POS tags and get re-swapped.
+                    g_verb_indices = {entry.get("i") for entry in g_verb_swaps or () if isinstance(entry, dict)}
+                    b_verb_indices = {entry.get("i") for entry in b_verb_swaps or () if isinstance(entry, dict)}
+
+                    g_candidates = [t for t in candidate_nouns(gdoc_orig, reflexive_subjects=g_reflexive_subjects) if t.i not in g_verb_indices]
                     g_candidates.sort(key=lambda t: t.i)
-                    b_candidates = candidate_nouns(bdoc_working)
+                    b_candidates = [t for t in candidate_nouns(bdoc_orig, reflexive_subjects=b_reflexive_subjects) if t.i not in b_verb_indices]
                     b_candidates.sort(key=lambda t: t.i)
 
                     noun_matches = []
@@ -441,8 +447,10 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                         b_match = _find_match(g_tok)
                         if b_match is None:
                             continue
-                        require_gender = _required_gender(g_tok, g_reflexive_subjects, gender_lex)
-                        require_person = (g_tok.i in g_reflexive_subjects) or bool(require_gender)
+                        reflexive_info_g = g_reflexive_subjects.get(g_tok.i) if isinstance(g_reflexive_subjects, dict) else None
+                        reflexive_info_b = b_reflexive_subjects.get(b_match.i) if isinstance(b_reflexive_subjects, dict) else None
+                        require_gender = _required_gender(g_tok, g_reflexive_subjects, gender_lex) or _required_gender(b_match, b_reflexive_subjects, gender_lex)
+                        require_person = bool(require_gender) or (reflexive_info_g.get("animate") if reflexive_info_g else False) or (reflexive_info_b.get("animate") if reflexive_info_b else False)
                         if not require_person and is_person_noun(g_tok.lemma_.lower()):
                             require_person = True
                         noun_matches.append(
@@ -492,6 +500,7 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                             forced_targets=g_target_specs,
                             rare_person_lemmas=rare_person_pool,
                             rare_gender_lemmas=rare_gender_map,
+                            reflexive_subjects=g_reflexive_subjects,
                         )
                         b_rare = None
                         if g_rare and g_swaps:
@@ -506,6 +515,7 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                     rare_person_lemmas=rare_person_pool,
                                     rare_gender_lemmas=rare_gender_map,
                                     override_lemmas=lemmas,
+                                    reflexive_subjects=b_reflexive_subjects,
                                 )
                         if not (
                             g_rare
@@ -527,8 +537,8 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
 
                 # Stage 2: adjective swaps (operates on the noun-swapped text)
                 if do_adj_swaps:
-                    gdoc_adj = nlp(g_variant)
-                    bdoc_adj = nlp(b_variant)
+                    gdoc_adj = gdoc_working
+                    bdoc_adj = bdoc_working
                     # Detect adjective targets on the original parse so noun swaps
                     # that confuse POS tagging (e.g., rare nouns tagged as PROPN)
                     # don't block adjective swaps.

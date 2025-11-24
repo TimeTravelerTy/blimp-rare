@@ -97,10 +97,13 @@ class VerbInventory:
     def __init__(self, entries: Sequence[VerbEntry]):
         self._entries: Tuple[VerbEntry, ...] = tuple(entries)
         frame_index: Dict[str, List[Tuple[VerbEntry, VerbFrameSpec]]] = {}
+        lookup_index: Dict[Tuple[str, str], Tuple[VerbEntry, VerbFrameSpec]] = {}
         for entry in self._entries:
             for frame in entry.frames:
                 frame_index.setdefault(frame.kind, []).append((entry, frame))
+                lookup_index[(entry.lemma.lower(), frame.kind)] = (entry, frame)
         self._frame_index = frame_index
+        self._lookup_index = lookup_index
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -176,13 +179,7 @@ class VerbInventory:
         lemma_norm = (lemma or "").strip().lower()
         if not lemma_norm:
             return None
-        for entry in self._entries:
-            if entry.lemma.lower() != lemma_norm:
-                continue
-            for frame in entry.frames:
-                if frame.kind == kind:
-                    return entry, frame
-        return None
+        return self._lookup_index.get((lemma_norm, kind))
 
     def filter_by_zipf(self, zipf_thr: Optional[float]) -> "VerbInventory":
         if zipf_thr is None:

@@ -11,11 +11,13 @@ from .inflect import (
     singularize_noun,
 )
 from .rarity import is_rare_lemma
+from .lemma_bank import is_person_noun
 from .verb_inventory import VerbInventory
 
 _PARTITIVE_HEADS = {"lot", "lots", "bunch", "number", "couple", "plenty"}
 _UPPER_SPECIAL = {"ii", "iii", "iv"}
 _ANIMATE_REFLEXIVES = {"himself", "herself", "themselves"}
+_INANIMATE_REFLEXIVES = {"itself"}
 _REFLEXIVE_GENDER = {
     "herself": "female",
     "himself": "male",
@@ -25,7 +27,7 @@ _ADJ_EXCLUDE = {"many", "most", "much", "few", "several"}
 _NOUN_FALSE_FRIENDS = {"reference"}  # verbs commonly mistagged as nouns
 _POOL_CACHE = {}
 
-_ABSTRACT_SUFFIXES = ("ness", "hood", "ship", "ism", "ity", "ment", "ance", "ence", "ency", "age", "is", "ia")
+_ABSTRACT_SUFFIXES = ("ness", "hood", "ship", "ism", "ity", "ment", "ance", "ence", "ency", "age", "is", "ia", "ry")
 _TAXON_SUFFIXES = ("idae", "ideae", "aceae", "ales")
 _SPECIAL_PLURALS = {
     "men",
@@ -57,6 +59,23 @@ _OBJ_DEPS = {"dobj", "obj"}
 _IOBJ_DEPS = {"iobj", "dative"}
 _PREP_DEPS = {"prep"}
 _PARTICLE_DEPS = {"prt"}
+_RARE_THAT_VERBS = (
+    "asseverate",
+    "avouch",
+    "avow",
+    "aver",
+    "attest",
+    "depose",
+    "intimate",
+    "profess",
+    "surmise",
+    "conjecture",
+    "speculate",
+    "postulate",
+    "posit",
+    "opine",
+    "assever",
+)
 
 # Allow compatible frame backoffs when exact matching fails.
 _FRAME_FAMILY = {
@@ -72,12 +91,13 @@ def reflexive_subject_indices(doc):
 
     The returned value acts like a mapping of ``token.i`` to a dictionary
     containing at least the reflexive pronoun (`pronoun`) and an optional
-    gender label inferred from the pronoun (`gender`).
+    gender label inferred from the pronoun (`gender`), plus an `animate`
+    boolean flag.
     """
     indices = {}
     for pron in doc:
         lower = pron.lower_
-        if pron.pos_ != "PRON" or lower not in _ANIMATE_REFLEXIVES:
+        if pron.pos_ != "PRON" or lower not in (_ANIMATE_REFLEXIVES | _INANIMATE_REFLEXIVES):
             continue
         heads = []
         head = pron.head
@@ -92,6 +112,7 @@ def reflexive_subject_indices(doc):
                     indices[child.i] = {
                         "pronoun": pron.text,
                         "gender": _REFLEXIVE_GENDER.get(lower),
+                        "animate": lower in _ANIMATE_REFLEXIVES,
                     }
     return indices
 
@@ -313,13 +334,13 @@ def _prepare_pools(
     return result
 
 
-def candidate_nouns(doc):
+def candidate_nouns(doc, reflexive_subjects=None):
     noun_chunk_indices = set()
     for chunk in doc.noun_chunks:
         for token in chunk:
             noun_chunk_indices.add(token.i)
     subject_indices = {t.i for t in doc if t.dep_ in {"nsubj", "nsubjpass"}}
-    reflexive_subjects = reflexive_subject_indices(doc)
+    reflexive_subjects = reflexive_subjects if reflexive_subjects is not None else reflexive_subject_indices(doc)
 
     candidates = []
     for t in doc:
@@ -449,12 +470,7 @@ def candidate_verbs(doc):
         return False
 
     for token in doc:
-        is_verbish = token.pos_ == "VERB" or (
-            # spaCy sometimes tags cleft/relative-clause verbs as NOUN (NN/NNS).
-            token.pos_ == "NOUN"
-            and token.tag_ in {"NN", "NNS"}
-            and token.dep_ in {"ccomp", "xcomp", "advcl", "relcl", "ROOT"}
-        )
+        is_verbish = token.pos_ == "VERB" or token.tag_.startswith("VB")
         if not is_verbish:
             continue
         if token.dep_ in _VERB_AUX_DEPS:
@@ -496,6 +512,7 @@ def noun_swap_all(
     rare_person_lemmas=None,
     rare_gender_lemmas=None,
     override_lemmas=None,
+    reflexive_subjects=None,
 ):
     """
     rare_lemmas: iterable[str] of candidate noun lemmas. If ``zipf_thr`` is None
@@ -520,7 +537,7 @@ def noun_swap_all(
 
     toks = [t.text for t in doc]
     swaps = []
-    reflexive_subjects = reflexive_subject_indices(doc)
+    reflexive_subjects = reflexive_subjects if reflexive_subjects is not None else reflexive_subject_indices(doc)
 
     if forced_targets is not None:
         seen = set()
@@ -551,14 +568,14 @@ def noun_swap_all(
             forced_tag = tag or token.tag_
             reflexive_info = reflexive_subjects.get(idx) if isinstance(reflexive_subjects, dict) else None
             if require_person is None:
-                require_person = bool(reflexive_info)
+                require_person = bool(reflexive_info.get("animate")) if reflexive_info else False
             if require_gender is None and reflexive_info:
                 require_gender = reflexive_info.get("gender")
             require_person = bool(require_person or require_gender)
             targets.append((token, forced_tag, bool(require_person), require_gender))
             seen.add(idx)
     else:
-        detected = candidate_nouns(doc)
+        detected = candidate_nouns(doc, reflexive_subjects=reflexive_subjects)
         # Deterministic order across Good/Bad
         detected.sort(key=lambda t: t.i)
         if noun_mode == "k":
@@ -568,7 +585,7 @@ def noun_swap_all(
         for t in detected:
             reflexive_info = reflexive_subjects.get(t.i) if isinstance(reflexive_subjects, dict) else None
             require_gender = reflexive_info.get("gender") if reflexive_info else None
-            require_person = bool(reflexive_info) or bool(require_gender)
+            require_person = (reflexive_info.get("animate") if reflexive_info else False) or bool(require_gender)
             targets.append((t, t.tag_, require_person, require_gender))
 
     if not targets:
@@ -627,6 +644,9 @@ def noun_swap_all(
         person_set = set(pool_person)
         pool_non_person = [w for w in pool if w not in person_set]
 
+        pool_person_checked = list(pool_person)
+        pool_non_person_checked = list(pool_non_person)
+
         gender_pools = {}
         if rare_gender_lemmas:
             for gender, items in rare_gender_lemmas.items():
@@ -640,9 +660,9 @@ def noun_swap_all(
         needs_non_person = any(not require_person for _, _, require_person, _ in targets)
         required_genders = {gender for _, _, _, gender in targets if gender}
 
-        if needs_person and not pool_person:
+        if needs_person and not pool_person_checked:
             return None, []
-        if needs_non_person and not pool_non_person:
+        if needs_non_person and not pool_non_person_checked:
             return None, []
         if enforce_gender:
             for gender in required_genders:
@@ -654,9 +674,9 @@ def noun_swap_all(
             if require_gender and enforce_gender:
                 choice_pool = gender_pools.get(require_gender)
             elif require_person:
-                choice_pool = pool_person
+                choice_pool = pool_person_checked
             else:
-                choice_pool = pool_non_person
+                choice_pool = pool_non_person_checked
             if not choice_pool:
                 return None, []
             lemma = rng.choice(choice_pool)
@@ -905,30 +925,12 @@ def verb_swap_all(
         if len(override_list) != len(targets):
             return None, []
 
-    rare_that_verbs = [
-        "asseverate",
-        "avouch",
-        "avow",
-        "aver",
-        "attest",
-        "depose",
-        "intimate",
-        "profess",
-        "surmise",
-        "conjecture",
-        "speculate",
-        "postulate",
-        "posit",
-        "opine",
-        "assever",
-    ]
-
     for idx, target in enumerate(targets):
         if target.has_that_clause:
             spec = override_list[idx] if override_list is not None else None
             forced_lemma = spec.get("lemma") if isinstance(spec, dict) else None
             forced_frame = spec.get("frame") if isinstance(spec, dict) else None
-            options = [forced_lemma] if forced_lemma else list(rare_that_verbs)
+            options = [forced_lemma] if forced_lemma else list(_RARE_THAT_VERBS)
             rng.shuffle(options)
             chosen_lemma = None
             chosen_form = None
