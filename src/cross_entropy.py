@@ -8,16 +8,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 @dataclass
 class SequenceScore:
     text: str
-    ppl: float
-    avg_nll: float
     total_nll: float
     token_count: int
 
     def as_dict(self):
         return {
             "text": self.text,
-            "ppl": self.ppl,
-            "avg_nll": self.avg_nll,
             "total_nll": self.total_nll,
             "token_count": self.token_count,
         }
@@ -43,9 +39,9 @@ def _select_dtype(device: torch.device, requested: Optional[str]):
     return torch.float32
 
 
-class LlamaPerplexityScorer:
+class LlamaCrossEntropyScorer:
     """
-    Fast perplexity scorer for decoder-only models (defaults to Llama 3 8B).
+    Fast sentence-level NLL scorer for decoder-only models (defaults to Llama 3 8B).
     Uses left padding, autocast, and no_grad/inference_mode to keep GPU passes quick.
     """
 
@@ -66,7 +62,7 @@ class LlamaPerplexityScorer:
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
-        model_kwargs = {"torch_dtype": self.dtype}
+        model_kwargs = {"dtype": self.dtype}
         if device_map:
             model_kwargs["device_map"] = device_map
         self.model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
@@ -86,7 +82,8 @@ class LlamaPerplexityScorer:
         results: List[SequenceScore] = []
         if not texts:
             return results
-        use_amp = self.device.type == "cuda"
+        # Enable autocast on CUDA/MPS; stay in full precision elsewhere.
+        use_amp = self.device.type in {"cuda", "mps"}
         for batch in _chunked(texts, batch_size):
             encoded = self.tokenizer(
                 list(batch),
@@ -98,7 +95,11 @@ class LlamaPerplexityScorer:
             input_ids = encoded["input_ids"].to(self.device, non_blocking=True)
             attention_mask = encoded["attention_mask"].to(self.device, non_blocking=True)
             with torch.inference_mode():
-                with torch.cuda.amp.autocast(enabled=use_amp, dtype=self.dtype):
+                with torch.amp.autocast(
+                    device_type=self.device.type,
+                    dtype=self.dtype,
+                    enabled=use_amp,
+                ):
                     outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
             logits = outputs.logits
             logprobs = torch.log_softmax(logits, dim=-1)
@@ -109,15 +110,11 @@ class LlamaPerplexityScorer:
             nll = nll * shift_mask
             token_counts = shift_mask.sum(dim=1)
             total_nll = nll.sum(dim=1)
-            avg_nll = total_nll / torch.clamp(token_counts, min=1)
-            ppl = torch.exp(avg_nll)
             for i, text in enumerate(batch):
                 count = int(token_counts[i].item())
                 results.append(
                     SequenceScore(
                         text=text,
-                        ppl=float(ppl[i].item()),
-                        avg_nll=float(avg_nll[i].item()),
                         total_nll=float(total_nll[i].item()),
                         token_count=count,
                     )

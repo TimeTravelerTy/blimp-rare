@@ -1,14 +1,14 @@
 import argparse
 import json
-import math
 import os
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from src.perplexity import LlamaPerplexityScorer  # noqa: E402
+from src.cross_entropy import LlamaCrossEntropyScorer  # noqa: E402
 
 
 Variant = str
@@ -53,6 +53,7 @@ def _build_items(records: List[dict]):
             text = rec.get(variant)
             if not text:
                 continue
+            char_len = len(text)
             items.append(
                 {
                     "variant": variant,
@@ -62,6 +63,7 @@ def _build_items(records: List[dict]):
                     "group": rec.get("group"),
                     "phenomenon": rec.get("phenomenon"),
                     "subtask": rec.get("subtask"),
+                    "char_len": char_len,
                 }
             )
     return items
@@ -71,29 +73,29 @@ def _aggregate_by_variant(scored_items: List[dict]) -> Dict[Variant, Dict[str, f
     stats: Dict[Variant, Dict[str, float]] = {}
     for variant in VARIANTS:
         subset = [it for it in scored_items if it["variant"] == variant]
-        ppls = [it["ppl"] for it in subset]
+        totals = [it["total_nll"] for it in subset]
+        per_char = [it["nll_per_char"] for it in subset]
         tokens = [it["token_count"] for it in subset]
         stats[variant] = {
             "count": len(subset),
-            "mean_ppl": _mean(ppls),
-            "median_ppl": _median(ppls),
+            "mean_total_nll": _mean(totals),
+            "median_total_nll": _median(totals),
+            "mean_nll_per_char": _mean(per_char),
+            "median_nll_per_char": _median(per_char),
             "mean_tokens": _mean(tokens),
         }
     return stats
 
 
-def _pairwise_stats(per_record: Dict[int, Dict[Variant, dict]], typical: Variant, rare: Variant):
+def _pairwise_stats(per_record: Dict[int, Dict[Variant, dict]], typical: Variant, rare: Variant, field: str):
     deltas = []
-    ratios = []
     rare_higher = 0
     for variants in per_record.values():
         if typical not in variants or rare not in variants:
             continue
-        t = variants[typical]["ppl"]
-        r = variants[rare]["ppl"]
+        t = variants[typical][field]
+        r = variants[rare][field]
         deltas.append(r - t)
-        if t > 0:
-            ratios.append(r / t)
         rare_higher += int(r > t)
     total = len(deltas)
     return {
@@ -101,22 +103,18 @@ def _pairwise_stats(per_record: Dict[int, Dict[Variant, dict]], typical: Variant
         "pct_rare_higher": (rare_higher / total * 100.0) if total else float("nan"),
         "mean_delta": _mean(deltas),
         "median_delta": _median(deltas),
-        "mean_ratio": _mean(ratios),
     }
 
 
-def _good_bad_stats(per_record: Dict[int, Dict[Variant, dict]], good: Variant, bad: Variant):
+def _good_bad_stats(per_record: Dict[int, Dict[Variant, dict]], good: Variant, bad: Variant, field: str):
     deltas = []
-    ratios = []
     bad_higher = 0
     for variants in per_record.values():
         if good not in variants or bad not in variants:
             continue
-        g = variants[good]["ppl"]
-        b = variants[bad]["ppl"]
+        g = variants[good][field]
+        b = variants[bad][field]
         deltas.append(b - g)
-        if g > 0:
-            ratios.append(b / g)
         bad_higher += int(b > g)
     total = len(deltas)
     return {
@@ -124,42 +122,52 @@ def _good_bad_stats(per_record: Dict[int, Dict[Variant, dict]], good: Variant, b
         "pct_bad_higher": (bad_higher / total * 100.0) if total else float("nan"),
         "mean_delta": _mean(deltas),
         "median_delta": _median(deltas),
-        "mean_ratio": _mean(ratios),
     }
 
 
 def _subtask_deltas(scored_items: List[dict], typical: Variant, rare: Variant, top_k: int = 8):
     grouped: Dict[str, Dict[Variant, List[float]]] = defaultdict(lambda: defaultdict(list))
     for item in scored_items:
-        grouped[item.get("subtask") or "unknown"][item["variant"]].append(item["ppl"])
+        grouped[item.get("subtask") or "unknown"][item["variant"]].append(item["total_nll"])
     rows = []
     for subtask, variants in grouped.items():
         if typical not in variants or rare not in variants:
             continue
         t_mean = _mean(variants[typical])
         r_mean = _mean(variants[rare])
-        ratio = r_mean / t_mean if t_mean > 0 else float("nan")
         rows.append(
             {
                 "subtask": subtask,
                 "typical_mean": t_mean,
                 "rare_mean": r_mean,
                 "delta": r_mean - t_mean,
-                "ratio": ratio,
             }
         )
-    rows.sort(key=lambda r: (1, 0.0) if math.isnan(r["ratio"]) else (0, -r["ratio"]))
+    rows.sort(key=lambda r: -r["delta"])
     return rows[:top_k]
 
 
-def _save_details(path: Optional[str], scored_items: List[dict]):
+def _default_out_path(model: str, limit: Optional[int]) -> Path:
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    model_slug = model.split("/")[-1].replace(".", "_")
+    limit_part = f"n{limit}" if limit is not None else "all"
+    name = f"{ts}_{model_slug}_{limit_part}.json"
+    return Path("results") / "cross_entropy_runs" / name
+
+
+def _save_single_json(path: Path, obj):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+def _save_json(path: Optional[str], obj):
     if not path:
         return
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as f:
-        for item in scored_items:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        json.dump(obj, f, ensure_ascii=False, indent=2)
 
 
 def main():
@@ -177,7 +185,7 @@ def main():
         help="Pass through to transformers.from_pretrained device_map (e.g., 'auto' for multi-GPU).",
     )
     ap.add_argument("--compile", action="store_true", help="Try torch.compile for extra throughput on CUDA.")
-    ap.add_argument("--details-out", default=None, help="Optional JSONL to write per-variant perplexities.")
+    ap.add_argument("--out", default=None, help="Optional JSON output path; defaults to results/cross_entropy_runs/<timestamp>_<model>_<n>.json")
     args = ap.parse_args()
 
     records = load_records(args.data, args.limit)
@@ -185,7 +193,7 @@ def main():
     items = _build_items(records)
     print(f"Scoring {len(items)} variants across {len(VARIANTS)} buckets...")
 
-    scorer = LlamaPerplexityScorer(
+    scorer = LlamaCrossEntropyScorer(
         model_name=args.model,
         device=args.device,
         dtype=args.dtype,
@@ -198,12 +206,12 @@ def main():
         max_length=args.max_length,
     )
     for item, score in zip(items, scores):
+        char_len = max(1, item.get("char_len", len(item.get("text", "")) or 0))
         item.update(
             {
-                "ppl": score.ppl,
-                "avg_nll": score.avg_nll,
                 "total_nll": score.total_nll,
                 "token_count": score.token_count,
+                "nll_per_char": score.total_nll / char_len,
             }
         )
 
@@ -212,54 +220,93 @@ def main():
         per_record[item["row"]][item["variant"]] = item
 
     variant_stats = _aggregate_by_variant(items)
-    rare_good = _pairwise_stats(per_record, "good_typical", "good_rare")
-    rare_bad = _pairwise_stats(per_record, "bad_typical", "bad_rare")
-    good_vs_bad_typical = _good_bad_stats(per_record, "good_typical", "bad_typical")
-    good_vs_bad_rare = _good_bad_stats(per_record, "good_rare", "bad_rare")
+    rare_good = _pairwise_stats(per_record, "good_typical", "good_rare", "total_nll")
+    rare_bad = _pairwise_stats(per_record, "bad_typical", "bad_rare", "total_nll")
+    good_vs_bad_typical = _good_bad_stats(per_record, "good_typical", "bad_typical", "total_nll")
+    good_vs_bad_rare = _good_bad_stats(per_record, "good_rare", "bad_rare", "total_nll")
+    rare_good_char = _pairwise_stats(per_record, "good_typical", "good_rare", "nll_per_char")
+    rare_bad_char = _pairwise_stats(per_record, "bad_typical", "bad_rare", "nll_per_char")
+    good_vs_bad_typical_char = _good_bad_stats(per_record, "good_typical", "bad_typical", "nll_per_char")
+    good_vs_bad_rare_char = _good_bad_stats(per_record, "good_rare", "bad_rare", "nll_per_char")
     subtask_rows = _subtask_deltas(items, "good_typical", "good_rare")
 
-    print("\nVariant perplexities:")
+    out_path = Path(args.out) if args.out else _default_out_path(args.model, args.limit)
+
+    summary = {
+        "data": args.data,
+        "model": args.model,
+        "device": args.device,
+        "dtype": args.dtype,
+        "batch_size": args.batch_size,
+        "max_length": args.max_length,
+        "limit": args.limit,
+        "variant_stats": variant_stats,
+        "rare_vs_typical": {"good": rare_good, "bad": rare_bad},
+        "good_vs_bad": {"typical": good_vs_bad_typical, "rare": good_vs_bad_rare},
+        "rare_vs_typical_char": {"good": rare_good_char, "bad": rare_bad_char},
+        "good_vs_bad_char": {"typical": good_vs_bad_typical_char, "rare": good_vs_bad_rare_char},
+        "subtask_gaps_good": subtask_rows,
+        "details": items,
+    }
+
+    print("\nVariant sentence-level NLL:")
     for variant in VARIANTS:
         stats = variant_stats[variant]
         print(
             f"  {variant:12} count={stats['count']:5d} "
-            f"mean_ppl={stats['mean_ppl']:.2f} median_ppl={stats['median_ppl']:.2f} "
+            f"mean_total_nll={stats['mean_total_nll']:.4f} median_total_nll={stats['median_total_nll']:.4f} "
+            f"mean_nll_per_char={stats['mean_nll_per_char']:.6f} median_nll_per_char={stats['median_nll_per_char']:.6f} "
             f"mean_tokens={stats['mean_tokens']:.1f}"
         )
 
     print("\nRare vs typical deltas:")
     print(
         f"  good: pairs={rare_good['pairs']:5d} pct_rare_higher={rare_good['pct_rare_higher']:.1f}% "
-        f"mean_delta={rare_good['mean_delta']:.2f} median_delta={rare_good['median_delta']:.2f} "
-        f"mean_ratio={rare_good['mean_ratio']:.3f}"
+        f"mean_delta={rare_good['mean_delta']:.4f} median_delta={rare_good['median_delta']:.4f}"
     )
     print(
         f"  bad : pairs={rare_bad['pairs']:5d} pct_rare_higher={rare_bad['pct_rare_higher']:.1f}% "
-        f"mean_delta={rare_bad['mean_delta']:.2f} median_delta={rare_bad['median_delta']:.2f} "
-        f"mean_ratio={rare_bad['mean_ratio']:.3f}"
+        f"mean_delta={rare_bad['mean_delta']:.4f} median_delta={rare_bad['median_delta']:.4f}"
+    )
+    print("\nRare vs typical deltas (per char):")
+    print(
+        f"  good: pairs={rare_good_char['pairs']:5d} pct_rare_higher={rare_good_char['pct_rare_higher']:.1f}% "
+        f"mean_delta={rare_good_char['mean_delta']:.6f} median_delta={rare_good_char['median_delta']:.6f}"
+    )
+    print(
+        f"  bad : pairs={rare_bad_char['pairs']:5d} pct_rare_higher={rare_bad_char['pct_rare_higher']:.1f}% "
+        f"mean_delta={rare_bad_char['mean_delta']:.6f} median_delta={rare_bad_char['median_delta']:.6f}"
     )
 
     print("\nGood vs bad checks:")
     print(
         f"  typical: pairs={good_vs_bad_typical['pairs']:5d} pct_bad_higher={good_vs_bad_typical['pct_bad_higher']:.1f}% "
-        f"mean_delta={good_vs_bad_typical['mean_delta']:.2f} median_delta={good_vs_bad_typical['median_delta']:.2f} "
-        f"mean_ratio={good_vs_bad_typical['mean_ratio']:.3f}"
+        f"mean_delta={good_vs_bad_typical['mean_delta']:.4f} median_delta={good_vs_bad_typical['median_delta']:.4f}"
     )
     print(
         f"  rare   : pairs={good_vs_bad_rare['pairs']:5d} pct_bad_higher={good_vs_bad_rare['pct_bad_higher']:.1f}% "
-        f"mean_delta={good_vs_bad_rare['mean_delta']:.2f} median_delta={good_vs_bad_rare['median_delta']:.2f} "
-        f"mean_ratio={good_vs_bad_rare['mean_ratio']:.3f}"
+        f"mean_delta={good_vs_bad_rare['mean_delta']:.4f} median_delta={good_vs_bad_rare['median_delta']:.4f}"
+    )
+    print("\nGood vs bad checks (per char):")
+    print(
+        f"  typical: pairs={good_vs_bad_typical_char['pairs']:5d} pct_bad_higher={good_vs_bad_typical_char['pct_bad_higher']:.1f}% "
+        f"mean_delta={good_vs_bad_typical_char['mean_delta']:.6f} median_delta={good_vs_bad_typical_char['median_delta']:.6f}"
+    )
+    print(
+        f"  rare   : pairs={good_vs_bad_rare_char['pairs']:5d} pct_bad_higher={good_vs_bad_rare_char['pct_bad_higher']:.1f}% "
+        f"mean_delta={good_vs_bad_rare_char['mean_delta']:.6f} median_delta={good_vs_bad_rare_char['median_delta']:.6f}"
     )
 
     if subtask_rows:
-        print("\nLargest rare/typical gaps by subtask (good sentences):")
+        print("\nLargest rare/typical NLL gaps by subtask (good sentences):")
         for row in subtask_rows:
             print(
-                f"  {row['subtask']}: delta={row['delta']:.2f} ratio={row['ratio']:.3f} "
-                f"(typical_mean={row['typical_mean']:.2f}, rare_mean={row['rare_mean']:.2f})"
+                f"  {row['subtask']}: delta={row['delta']:.4f} "
+                f"(typical_mean={row['typical_mean']:.4f}, rare_mean={row['rare_mean']:.4f})"
             )
 
-    _save_details(args.details_out, items)
+    _save_single_json(out_path, summary)
+    print(f"\nWrote combined summary+details to {out_path}")
 
 
 if __name__ == "__main__":
