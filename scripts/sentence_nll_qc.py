@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from src.cross_entropy import LlamaCrossEntropyScorer  # noqa: E402
+from src.sentence_nll import LlamaNLLScorer  # noqa: E402
 
 
 Variant = str
@@ -151,8 +151,8 @@ def _default_out_path(model: str, limit: Optional[int]) -> Path:
     ts = time.strftime("%Y%m%d-%H%M%S")
     model_slug = model.split("/")[-1].replace(".", "_")
     limit_part = f"n{limit}" if limit is not None else "all"
-    name = f"{ts}_{model_slug}_{limit_part}.json"
-    return Path("results") / "cross_entropy_runs" / name
+    name = f"{ts}_{model_slug}_{limit_part}_sentence-nll.json"
+    return Path("results") / "sentence_nll_runs" / name
 
 
 def _save_single_json(path: Path, obj):
@@ -185,7 +185,11 @@ def main():
         help="Pass through to transformers.from_pretrained device_map (e.g., 'auto' for multi-GPU).",
     )
     ap.add_argument("--compile", action="store_true", help="Try torch.compile for extra throughput on CUDA.")
-    ap.add_argument("--out", default=None, help="Optional JSON output path; defaults to results/cross_entropy_runs/<timestamp>_<model>_<n>.json")
+    ap.add_argument(
+        "--out",
+        default=None,
+        help="Optional JSON output path; defaults to results/sentence_nll_runs/<timestamp>_<model>_<n>_sentence-nll.json",
+    )
     args = ap.parse_args()
 
     records = load_records(args.data, args.limit)
@@ -193,7 +197,7 @@ def main():
     items = _build_items(records)
     print(f"Scoring {len(items)} variants across {len(VARIANTS)} buckets...")
 
-    scorer = LlamaCrossEntropyScorer(
+    scorer = LlamaNLLScorer(
         model_name=args.model,
         device=args.device,
         dtype=args.dtype,

@@ -39,7 +39,7 @@ def _select_dtype(device: torch.device, requested: Optional[str]):
     return torch.float32
 
 
-class LlamaCrossEntropyScorer:
+class LlamaNLLScorer:
     """
     Fast sentence-level NLL scorer for decoder-only models (defaults to Llama 3 8B).
     Uses left padding, autocast, and no_grad/inference_mode to keep GPU passes quick.
