@@ -49,6 +49,11 @@ def load_records(path: str, limit: Optional[int] = None) -> List[dict]:
 def _build_items(records: List[dict]):
     items = []
     for pos, rec in enumerate(records):
+        meta = rec.get("meta") or {}
+        g_swaps = meta.get("g_swaps") or []
+        g_adj_swaps = meta.get("g_adj_swaps") or []
+        g_verb_swaps = meta.get("g_verb_swaps") or []
+        k_swaps = len(g_swaps) + len(g_adj_swaps) + len(g_verb_swaps)
         for variant in VARIANTS:
             text = rec.get(variant)
             if not text:
@@ -64,6 +69,7 @@ def _build_items(records: List[dict]):
                     "phenomenon": rec.get("phenomenon"),
                     "subtask": rec.get("subtask"),
                     "char_len": char_len,
+                    "k_swaps": k_swaps,
                 }
             )
     return items
@@ -145,6 +151,30 @@ def _subtask_deltas(scored_items: List[dict], typical: Variant, rare: Variant, t
         )
     rows.sort(key=lambda r: -r["delta"])
     return rows[:top_k]
+
+
+def _rare_penalty_stats(per_record: Dict[int, Dict[Variant, dict]]):
+    per_swap_total = []
+    per_swap_char = []
+    for variants in per_record.values():
+        if "good_typical" not in variants or "good_rare" not in variants:
+            continue
+        rare = variants["good_rare"]
+        typical = variants["good_typical"]
+        k = rare.get("k_swaps") or typical.get("k_swaps") or 0
+        if k <= 0:
+            continue
+        delta_total = rare["total_nll"] - typical["total_nll"]
+        delta_char = rare["nll_per_char"] - typical["nll_per_char"]
+        per_swap_total.append(delta_total / k)
+        per_swap_char.append(delta_char / k)
+    return {
+        "count": len(per_swap_total),
+        "mean_per_swap_nll": _mean(per_swap_total),
+        "median_per_swap_nll": _median(per_swap_total),
+        "mean_per_swap_nll_per_char": _mean(per_swap_char),
+        "median_per_swap_nll_per_char": _median(per_swap_char),
+    }
 
 
 def _default_out_path(model: str, limit: Optional[int]) -> Path:
@@ -232,6 +262,7 @@ def main():
     rare_bad_char = _pairwise_stats(per_record, "bad_typical", "bad_rare", "nll_per_char")
     good_vs_bad_typical_char = _good_bad_stats(per_record, "good_typical", "bad_typical", "nll_per_char")
     good_vs_bad_rare_char = _good_bad_stats(per_record, "good_rare", "bad_rare", "nll_per_char")
+    rare_penalty = _rare_penalty_stats(per_record)
     subtask_rows = _subtask_deltas(items, "good_typical", "good_rare")
 
     out_path = Path(args.out) if args.out else _default_out_path(args.model, args.limit)
@@ -249,6 +280,7 @@ def main():
         "good_vs_bad": {"typical": good_vs_bad_typical, "rare": good_vs_bad_rare},
         "rare_vs_typical_char": {"good": rare_good_char, "bad": rare_bad_char},
         "good_vs_bad_char": {"typical": good_vs_bad_typical_char, "rare": good_vs_bad_rare_char},
+        "rare_penalty_per_swap": rare_penalty,
         "subtask_gaps_good": subtask_rows,
         "details": items,
     }
@@ -299,6 +331,15 @@ def main():
     print(
         f"  rare   : pairs={good_vs_bad_rare_char['pairs']:5d} pct_bad_higher={good_vs_bad_rare_char['pct_bad_higher']:.1f}% "
         f"mean_delta={good_vs_bad_rare_char['mean_delta']:.6f} median_delta={good_vs_bad_rare_char['median_delta']:.6f}"
+    )
+
+    print("\nRare penalty per swapped site (good pairs only):")
+    print(
+        f"  count={rare_penalty['count']:5d} "
+        f"mean_per_swap_nll={rare_penalty['mean_per_swap_nll']:.4f} "
+        f"median_per_swap_nll={rare_penalty['median_per_swap_nll']:.4f} "
+        f"mean_per_swap_nll_per_char={rare_penalty['mean_per_swap_nll_per_char']:.6f} "
+        f"median_per_swap_nll_per_char={rare_penalty['median_per_swap_nll_per_char']:.6f}"
     )
 
     if subtask_rows:

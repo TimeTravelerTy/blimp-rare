@@ -23,6 +23,7 @@ build/
 data/processed/
 data/external/
 data/raw/
+results/
 
 # OS
 .DS_Store
