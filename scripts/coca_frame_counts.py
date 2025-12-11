@@ -13,13 +13,20 @@ import argparse
 import csv
 import tarfile
 import zipfile
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-import spacy
+import os
 import sys
 import time
+import warnings
+
+# Suppress LibreSSL warnings emitted by urllib3 (inherited by child processes).
+os.environ.setdefault("PYTHONWARNINGS", "ignore:::urllib3.exceptions.NotOpenSSLWarning")
+warnings.filterwarnings("ignore", message=".*OpenSSL.*", category=Warning, module="urllib3")
+
+import spacy
 
 # Dependencies considered as direct objects.
 _OBJ_DEPS = {"dobj", "obj"}
@@ -144,11 +151,11 @@ def tally_frames(
 ) -> Tuple[Counter, Counter]:
     token_counts: Counter = Counter()
     doc_counts: Counter = Counter()
-    current_doc = None
-    doc_seen: Dict[str, set] = defaultdict(set)
 
-    texts: List[str] = []
-    meta: List[str] = []
+    doc_buffer: List[str] = []
+    doc_id_current: Optional[str] = None
+    doc_seen: set = set()
+
     processed_sent = 0
     start = time.time()
     next_log = start
@@ -175,33 +182,12 @@ def tally_frames(
         print(msg, end="", file=sys.stderr, flush=True)
         next_log = now + log_interval_sec
 
-    for doc_id, sent, lemmas in _iter_wlp_sentences(tar_path):
-        if focus_verbs is not None and focus_verbs.isdisjoint(lemmas):
-            continue
-        texts.append(sent)
-        meta.append(doc_id)
-        if len(texts) >= batch_size:
-            for parsed, d_id in zip(nlp.pipe(texts, n_process=n_process, batch_size=batch_size), meta):
-                seen = doc_seen[d_id]
-                for tok in parsed:
-                    if tok.pos_ != "VERB" and not tok.tag_.startswith("VB"):
-                        continue
-                    frame_info = _frame_from_parse(tok)
-                    if not frame_info:
-                        continue
-                    kind, prep = frame_info
-                    key = (tok.lemma_.lower(), kind, prep or "")
-                    token_counts[key] += 1
-                    if key not in seen:
-                        doc_counts[key] += 1
-                        seen.add(key)
-            processed_sent += len(texts)
-            _log()
-            texts.clear()
-            meta.clear()
-    if texts:
-        for parsed, d_id in zip(nlp.pipe(texts, n_process=n_process, batch_size=batch_size), meta):
-            seen = doc_seen[d_id]
+    def _process_doc_sentences(sents: List[str]):
+        nonlocal processed_sent, doc_seen
+        if not sents:
+            return
+        doc_seen = set()
+        for parsed in nlp.pipe(sents, n_process=n_process, batch_size=batch_size):
             for tok in parsed:
                 if tok.pos_ != "VERB" and not tok.tag_.startswith("VB"):
                     continue
@@ -211,11 +197,24 @@ def tally_frames(
                 kind, prep = frame_info
                 key = (tok.lemma_.lower(), kind, prep or "")
                 token_counts[key] += 1
-                if key not in seen:
+                if key not in doc_seen:
                     doc_counts[key] += 1
-                    seen.add(key)
-        processed_sent += len(texts)
+                    doc_seen.add(key)
+        processed_sent += len(sents)
         _log()
+
+    for doc_id, sent, lemmas in _iter_wlp_sentences(tar_path):
+        if focus_verbs is not None and focus_verbs.isdisjoint(lemmas):
+            continue
+        if doc_id_current is None:
+            doc_id_current = doc_id
+        if doc_id != doc_id_current:
+            _process_doc_sentences(doc_buffer)
+            doc_buffer = []
+            doc_id_current = doc_id
+        doc_buffer.append(sent)
+
+    _process_doc_sentences(doc_buffer)
     _log(force=True)
     print(file=sys.stderr)
     return token_counts, doc_counts
