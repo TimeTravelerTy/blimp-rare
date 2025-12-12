@@ -113,6 +113,11 @@ if __name__ == "__main__":
     ap.add_argument("--adj_lemma_source", choices=["manual", "oewn"], default="oewn")
     ap.add_argument("--verb_lemma_source", choices=["manual", "oewn"], default="oewn")
     ap.add_argument("--verb_inventory", default=None)
+    ap.add_argument(
+        "--verb_inventory_override",
+        default=None,
+        help="Path to a precomputed verb inventory JSON to use directly (bypasses VerbNet/OEWN building).",
+    )
     ap.add_argument("--verb_source", choices=["verbnet", "oewn", "manual"], default="verbnet")
     ap.add_argument("--verbnet_dir", default=None, help="Path to VerbNet corpus root (e.g., ~/nltk_data/corpora/verbnet3).")
     ap.add_argument("--oewn_lexicon", default="oewn:2021")
@@ -192,7 +197,10 @@ if __name__ == "__main__":
 
     verb_inventory_obj = None
     if wants_verbs:
-        if args.verb_source == "manual":
+        if args.verb_inventory_override:
+            verb_inventory_obj = load_verb_inventory(args.verb_inventory_override)
+            print(f"[VerbInventory] Loaded override inventory ({len(verb_inventory_obj.entries)} entries) from {args.verb_inventory_override}.")
+        elif args.verb_source == "manual":
             if not args.verb_inventory:
                 ap.error("Manual verb inventory requested but --verb_inventory path not provided.")
             verb_inventory_obj = load_verb_inventory(args.verb_inventory)

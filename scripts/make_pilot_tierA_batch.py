@@ -24,8 +24,9 @@ def main() -> None:
         description="Generate multiple pilot tier A datasets for a list of Zipf thresholds."
     )
     ap.add_argument(
-        "zipf_values",
+        "--zipf_values",
         nargs="+",
+        required=True,
         type=float,
         help="One or more Zipf thresholds to pass as --zipf_all to make_pilot_tierA.py.",
     )
@@ -44,12 +45,7 @@ def main() -> None:
         action="store_true",
         help="Print the per-threshold commands without executing them.",
     )
-    ap.add_argument(
-        "passthrough",
-        nargs=argparse.REMAINDER,
-        help="Additional args forwarded to make_pilot_tierA.py; prefix them with --",
-    )
-    args = ap.parse_args()
+    args, passthrough = ap.parse_known_args()
 
     script_path = Path(__file__).resolve().parent / "make_pilot_tierA.py"
     out_dir = Path(args.out_dir)
@@ -66,7 +62,7 @@ def main() -> None:
             str(zipf_val),
             "--out",
             str(out_path),
-            *args.passthrough,
+            *passthrough,
         ]
         cmd_text = " ".join(shlex.quote(part) for part in cmd)
         print(f"[Batch] zipf_all={zipf_val} -> {out_path}")
