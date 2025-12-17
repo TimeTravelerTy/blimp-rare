@@ -1,6 +1,8 @@
 import random
+import json
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, List, Optional
 from wordfreq import zipf_frequency
 
@@ -226,6 +228,9 @@ _THAT_VERBS = (
     "write",
 )
 
+# Optional COCA-derived whitelist for clausal complement verbs.
+_CLAUSE_VERB_WHITELIST_PATH = Path("data") / "processed" / "clause_verb_whitelists.json"
+
 # Allow compatible frame backoffs when exact matching fails.
 _FRAME_FAMILY = {
     # Intransitive verbs can align with simple transitives.
@@ -412,7 +417,7 @@ def _adjust_indefinite_articles(toks):
 
 
 def _detokenize(toks):
-    attach_no_space = {".", ",", "!", "?", ";", ":", "n't", "'s", "'re", "'ve", "'d", "'ll", "'m"}
+    attach_no_space = {".", ",", "!", "?", ";", ":", "n't", "'s", "'re", "'ve", "'d", "'ll", "'m", "-"}
     text = ""
     prev = ""
     for tok in toks:
@@ -421,7 +426,7 @@ def _detokenize(toks):
         if not text:
             text = tok
         else:
-            if tok in attach_no_space or tok.startswith("'") or prev == "'":
+            if tok in attach_no_space or tok.startswith("'") or prev == "-":
                 text += tok
             else:
                 text += " " + tok
@@ -662,6 +667,8 @@ class VerbTarget:
     prep_token: Optional[Any]
     particle_token: Optional[Any]
     has_that_clause: bool = False
+    has_clausal_complement: bool = False
+    wh_marker: Optional[str] = None
 
 
 def _frame_kind_for_verb(token):
@@ -707,18 +714,119 @@ def candidate_verbs(doc):
     transitive, ditransitive, and verbs selecting a single PP complement.
     """
     candidates = []
-    def _has_that_complement(token):
+    def _ccomp_child(token):
         for child in token.children:
             if child.dep_ == "ccomp":
-                # Look for 'that' marker inside the clause.
-                for cc_tok in child.subtree:
-                    if cc_tok.text.lower() == "that" and cc_tok.dep_ == "mark":
-                        return True
+                return child
+        return None
+
+    def _has_that_complement(ccomp_token):
+        if ccomp_token is None:
+            return False
+        # Look for 'that' marker inside the clause.
+        for cc_tok in ccomp_token.subtree:
+            if cc_tok.text.lower() == "that" and cc_tok.dep_ == "mark":
+                return True
         return False
 
+    def _wh_marker(ccomp_token) -> Optional[str]:
+        if ccomp_token is None:
+            return None
+        for cc_tok in ccomp_token.subtree:
+            lower = cc_tok.text.lower()
+            if lower in {"what", "who"}:
+                return lower
+        return None
+
+    def _maybe_participle_amod(tok) -> Optional[VerbTarget]:
+        """
+        Heuristic for cases where spaCy mis-tags participial relative clauses as ADJ/amod.
+
+        Example (desired): "sketches stunning Rhonda" where "stunning" should behave
+        like a transitive VBG verb with object "Rhonda", but spaCy can label it
+        ADJ/JJ with dep=amod and head=Rhonda (PROPN).
+        """
+        if tok.pos_ != "ADJ":
+            return None
+        if tok.dep_ != "amod":
+            return None
+        text = (tok.text or "").strip().lower()
+        if not text or not text.isalpha():
+            return None
+        if not text.endswith("ing") or len(text) < 5:
+            return None
+        if tok.i + 1 >= len(doc):
+            return None
+        nxt = doc[tok.i + 1]
+        if nxt is None or nxt.pos_ not in {"PROPN", "NOUN", "PRON"}:
+            return None
+        if tok.head != nxt:
+            return None
+        return VerbTarget(
+            token=tok,
+            tag="VBG",
+            frame_kind="trans",
+            lemma=text,
+            prep_token=None,
+            particle_token=None,
+            has_that_clause=False,
+            has_clausal_complement=False,
+            wh_marker=None,
+        )
+
+    def _maybe_participle_attr_noun(tok) -> Optional[VerbTarget]:
+        """
+        Heuristic for cases where a participle is mislabeled as a noun attribute
+        under `be` in existential-there infinitivals.
+
+        Example: "... there to be a unicycle dropping." where "dropping" should
+        behave like an intransitive VBG verb.
+        """
+        if tok.pos_ != "NOUN":
+            return None
+        if tok.dep_ != "attr":
+            return None
+        head = tok.head
+        if head is None or head.lemma_.lower() != "be":
+            return None
+        text = (tok.text or "").strip().lower()
+        if not text or not text.isalpha():
+            return None
+        if not text.endswith("ing") or len(text) < 5:
+            return None
+        if tok.i == 0:
+            return None
+        prev = tok.doc[tok.i - 1]
+        # spaCy can mis-tag the noun as ADJ in "a <noun> <participle>" sequences.
+        if prev is None or prev.pos_ not in {"NOUN", "PROPN", "ADJ"}:
+            return None
+        # Typically sentence-final (before punctuation).
+        if tok.i + 1 < len(tok.doc):
+            nxt = tok.doc[tok.i + 1]
+            if nxt is not None and nxt.pos_ != "PUNCT":
+                return None
+        return VerbTarget(
+            token=tok,
+            tag="VBG",
+            frame_kind="intr",
+            lemma=text,
+            prep_token=None,
+            particle_token=None,
+            has_that_clause=False,
+            has_clausal_complement=False,
+            wh_marker=None,
+        )
+
     for token in doc:
-        is_verbish = token.pos_ == "VERB" or token.tag_.startswith("VB")
-        if not is_verbish:
+        # Primary path: true verbs.
+        if token.pos_ != "VERB":
+            # Fallback: misparsed participial modifiers.
+            fallback = _maybe_participle_amod(token)
+            if fallback is not None:
+                candidates.append(fallback)
+            fallback2 = _maybe_participle_attr_noun(token)
+            if fallback2 is not None:
+                candidates.append(fallback2)
             continue
         if token.dep_ in _VERB_AUX_DEPS:
             continue
@@ -727,23 +835,82 @@ def candidate_verbs(doc):
         lemma = token.lemma_.lower()
         if lemma in _VERB_EXCLUDE:
             continue
+        if _is_ex_compound(token):
+            continue
         if not token.is_alpha:
             continue
         frame_info = _frame_kind_for_verb(token)
         if not frame_info:
             continue
         kind, prep, particle = frame_info
-        candidates.append(VerbTarget(
-            token=token,
-            tag=token.tag_,
-            frame_kind=kind,
-            lemma=lemma,
-            prep_token=prep,
-            particle_token=particle,
-            has_that_clause=_has_that_complement(token),
-        ))
+        ccomp = _ccomp_child(token)
+        has_ccomp = ccomp is not None
+        candidates.append(
+            VerbTarget(
+                token=token,
+                tag=token.tag_,
+                frame_kind=kind,
+                lemma=lemma,
+                prep_token=prep,
+                particle_token=particle,
+                has_that_clause=_has_that_complement(ccomp),
+                has_clausal_complement=has_ccomp,
+                wh_marker=_wh_marker(ccomp),
+            )
+        )
 
     return candidates
+
+
+@lru_cache(maxsize=1)
+def _load_clause_verb_whitelists() -> dict:
+    path = _CLAUSE_VERB_WHITELIST_PATH
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _clause_verb_options(target: VerbTarget, *, zipf_thr: Optional[float]) -> List[str]:
+    """
+    Return a list of candidate lemmas for verbs that embed clausal complements.
+    Falls back to the hardcoded list when no whitelist is available.
+    """
+    whitelists = _load_clause_verb_whitelists()
+    that_list = whitelists.get("that") if isinstance(whitelists.get("that"), list) else []
+    both_list = whitelists.get("both") if isinstance(whitelists.get("both"), list) else []
+
+    # Wh adjacency in COCA is noisy (often wh-objects like "buy what"), so for
+    # BLiMP filler-gap tasks we rely on clause-embedding verbs (that/ccomp) for
+    # both that- and wh-complements.
+    # Prefer the COCA-derived ``both`` set when available; it tends to exclude
+    # false positives that co-occur with "that" but rarely embed wh-clauses.
+    options = list(both_list) + list(that_list) + list(_THAT_VERBS)
+
+    # Normalize + dedupe.
+    normalized = []
+    seen = set()
+    for lemma in (options or ()):
+        if not lemma or not isinstance(lemma, str):
+            continue
+        norm = lemma.strip().lower()
+        if not norm or " " in norm or "_" in norm or "-" in norm:
+            continue
+        if norm in _VERB_EXCLUDE:
+            continue
+        if norm in seen:
+            continue
+        seen.add(norm)
+        normalized.append(norm)
+
+    if zipf_thr is None:
+        return normalized
+
+    filtered = [lemma for lemma in normalized if is_rare_lemma(lemma, zipf_thr)]
+    return filtered if filtered else normalized
 
 
 def noun_swap_all(
@@ -932,10 +1099,22 @@ def noun_swap_all(
                 choice_pool = pool_non_person_checked
             if not choice_pool:
                 return None, []
-            lemma = _weighted_choice_by_zipf(choice_pool, rng, temp=zipf_temp) if zipf_weighted else rng.choice(choice_pool)
-            form = inflect_noun(lemma, tag)
-            if not form:
+            pool_order = (
+                _weighted_order_by_zipf(choice_pool, rng, temp=zipf_temp)
+                if zipf_weighted
+                else list(choice_pool)
+            )
+            if not zipf_weighted:
+                rng.shuffle(pool_order)
+            chosen = None
+            for lemma in pool_order:
+                form = inflect_noun(lemma, tag)
+                if form:
+                    chosen = (lemma, form)
+                    break
+            if not chosen:
                 return None, []
+            lemma, form = chosen
             old_surface = _apply_noun_form(token, form, toks)
             swaps.append({
                 "i": token.i,
@@ -1094,6 +1273,30 @@ def _frame_requires_particle(kind: str) -> bool:
 def _normalize_forced_verb_targets(doc, forced_targets) -> List[VerbTarget]:
     seen = set()
     targets: List[VerbTarget] = []
+
+    def _ccomp_child(tok):
+        for child in tok.children:
+            if child.dep_ == "ccomp":
+                return child
+        return None
+
+    def _has_that(ccomp_tok) -> bool:
+        if ccomp_tok is None:
+            return False
+        for cc_tok in ccomp_tok.subtree:
+            if cc_tok.text.lower() == "that" and cc_tok.dep_ == "mark":
+                return True
+        return False
+
+    def _wh_marker(ccomp_tok) -> Optional[str]:
+        if ccomp_tok is None:
+            return None
+        for cc_tok in ccomp_tok.subtree:
+            lower = cc_tok.text.lower()
+            if lower in {"what", "who"}:
+                return lower
+        return None
+
     for entry in forced_targets or []:
         if isinstance(entry, dict):
             idx = entry.get("i")
@@ -1114,6 +1317,10 @@ def _normalize_forced_verb_targets(doc, forced_targets) -> List[VerbTarget]:
         if idx in seen:
             continue
         token = doc[idx]
+        ccomp = _ccomp_child(token)
+        has_ccomp = ccomp is not None
+        inferred_that = _has_that(ccomp)
+        inferred_wh = _wh_marker(ccomp)
         actual_tag = tag or token.tag_
         frame_kind = frame or _frame_kind_for_verb(token)
         if isinstance(frame_kind, tuple):
@@ -1137,7 +1344,9 @@ def _normalize_forced_verb_targets(doc, forced_targets) -> List[VerbTarget]:
             lemma=token.lemma_.lower(),
             prep_token=prep_token,
             particle_token=particle_token,
-            has_that_clause=that_clause or False,
+            has_that_clause=bool(that_clause or inferred_that),
+            has_clausal_complement=bool(has_ccomp or that_clause or inferred_that),
+            wh_marker=inferred_wh,
         ))
         seen.add(idx)
     return targets
@@ -1195,18 +1404,14 @@ def verb_swap_all(
             return None, []
 
     for idx, target in enumerate(targets):
-        if target.has_that_clause:
+        if target.has_clausal_complement:
             spec = override_list[idx] if override_list is not None else None
             forced_lemma = spec.get("lemma") if isinstance(spec, dict) else None
             forced_frame = spec.get("frame") if isinstance(spec, dict) else None
             if forced_lemma:
                 options = [forced_lemma]
             else:
-                options = list(_THAT_VERBS)
-                if zipf_thr is not None:
-                    filtered = [lemma for lemma in options if is_rare_lemma(lemma, zipf_thr)]
-                    if filtered:
-                        options = filtered
+                options = _clause_verb_options(target, zipf_thr=zipf_thr)
             if zipf_weighted:
                 options = _weighted_order_by_zipf(options, rng, temp=zipf_temp)
             else:
@@ -1230,7 +1435,7 @@ def verb_swap_all(
                 "new": toks[target.token.i],
                 "tag": target.tag,
                 "lemma": chosen_lemma,
-                "frame": forced_frame or "that_clause",
+                "frame": forced_frame or ("that_clause" if target.has_that_clause else "clausal_complement"),
                 "prep_i": None,
                 "prep_old": None,
                 "prep_new": None,
@@ -1294,6 +1499,19 @@ def verb_swap_all(
                     zipf_temp=zipf_temp,
                     restrict_transitivity=restrict,
                 )
+                if not sample and prep_text is not None:
+                    # If the inventory lacks an exact preposition match, fall back to
+                    # a frame match without constraining the preposition. The swapper
+                    # keeps the original preposition text when it differs anyway.
+                    sample = inventory.sample(
+                        fk,
+                        rng,
+                        desired_prep=None,
+                        desired_particle=particle_text,
+                        zipf_weighted=zipf_weighted,
+                        zipf_temp=zipf_temp,
+                        restrict_transitivity=restrict,
+                    )
                 if sample:
                     break
             if not sample:

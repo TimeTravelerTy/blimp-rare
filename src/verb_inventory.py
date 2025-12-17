@@ -70,9 +70,28 @@ def _is_transitive_like(kind: Optional[str]) -> bool:
 
 
 def _entry_has_transitive_like(entry: "VerbEntry") -> bool:
+    """
+    Return True if this lemma should be treated as having transitive-like uses.
+
+    In practice, ``ditrans_pp`` frames extracted from lexicons/corpora are noisier
+    than core ``trans``/``ditrans`` frames, especially for verbs that are
+    otherwise strongly intransitive. To avoid misclassifying such verbs as
+    ambitransitive (e.g., ``fall``), treat ``ditrans_pp`` as evidence of
+    transitivity only when the lemma is not otherwise intransitive.
+    """
+    has_core = False
+    has_ditrans_pp = False
     for frame in entry.frames:
-        if _is_transitive_like(frame.kind):
-            return True
+        if frame.kind in {"trans", "ditrans"}:
+            has_core = True
+        elif frame.kind == "ditrans_pp":
+            has_ditrans_pp = True
+        elif frame.kind and frame.kind.startswith("trans"):
+            has_core = True
+    if has_core:
+        return True
+    if has_ditrans_pp and not _entry_has_intr(entry):
+        return True
     return False
 
 

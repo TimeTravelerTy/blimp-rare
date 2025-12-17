@@ -84,24 +84,63 @@ _CONTROL_ADJECTIVES = [
 
 def _control_raising_adj_targets(doc):
     """
-    Detect predicate adjectives in expletive-there + be + ADJ + to ... structures.
+    Detect predicate modifiers (typically ADJ, sometimes ADV) in control/raising
+    constructions so we can swap them even when they are not attributive (amod).
+
+    Handles:
+    - expletive-there + be + ADJ + to ...
+    - it + to + be + ADJ + (that ...)
+    - copular be + ADJ/ADV + to + VERB (tough/raising-like surface forms)
     """
     there_indices = {
         t.i
         for t in doc
         if t.text.lower() == "there" and t.dep_ in {"expl", "nsubj", "nsubjpass", "csubj", "csubjpass"}
     }
-    if not there_indices:
-        return []
+
+    def _has_to_infinitive(be_tok) -> bool:
+        if be_tok is None:
+            return False
+        if any(child.text.lower() == "to" and child.dep_ in {"aux", "mark"} for child in be_tok.children):
+            return True
+        for child in be_tok.children:
+            if child.dep_ != "xcomp":
+                continue
+            if any(gc.text.lower() == "to" and gc.dep_ in {"aux", "mark"} for gc in child.children):
+                return True
+        return False
+
+    def _has_to_infinitive_via_predicate(pred_tok) -> bool:
+        if pred_tok is None:
+            return False
+        for child in pred_tok.children:
+            if child.dep_ != "xcomp":
+                continue
+            if any(gc.text.lower() == "to" and gc.dep_ in {"aux", "mark"} for gc in child.children):
+                return True
+        return False
+
     targets = []
+    seen = set()
+
     for tok in doc:
-        if tok.pos_ != "ADJ":
+        if tok.pos_ not in {"ADJ", "ADV"}:
+            continue
+        if tok.dep_ not in {"acomp", "advmod"}:
             continue
         head = tok.head
         if head is None or head.lemma_.lower() != "be":
             continue
-        if any(idx < tok.i for idx in there_indices):
-            targets.append(tok)
+        if not (_has_to_infinitive(head) or _has_to_infinitive_via_predicate(tok)):
+            continue
+        if tok.i in seen:
+            continue
+        # Preserve the original expletive-there constraint for those cases.
+        if there_indices and not any(idx < tok.i for idx in there_indices):
+            continue
+        seen.add(tok.i)
+        targets.append(tok)
+
     targets.sort(key=lambda t: t.i)
     return targets
 
@@ -398,11 +437,114 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                 adj_changed = False
 
                 # Stage 0: verb swaps
-                if do_verb_swaps:
-                    g_verb_candidates = candidate_verbs(gdoc_working)
-                    g_verb_candidates.sort(key=lambda t: t.token.i)
-                    b_verb_candidates = candidate_verbs(bdoc_working)
-                    b_verb_candidates.sort(key=lambda t: t.token.i)
+                # Skip verb swaps for irregular-forms tasks (where the target
+                # contrast is morphological).
+                if do_verb_swaps and phenomenon != "irregular_forms":
+                    # Ensure these are initialized each iteration; otherwise they can
+                    # leak across loop iterations when a branch doesn't assign them.
+                    g_verb_candidates = []
+                    b_verb_candidates = []
+
+                    def _find_passive_head(doc):
+                        for tok in doc:
+                            if tok.pos_ != "VERB" or not tok.tag_.startswith("VB"):
+                                continue
+                            if any(child.dep_ == "auxpass" for child in tok.children):
+                                return tok
+                        for tok in doc:
+                            if tok.pos_ != "VERB" or not tok.tag_.startswith("VB"):
+                                continue
+                            if tok.dep_ == "ROOT" and tok.tag_ == "VBN":
+                                return tok
+                        for tok in doc:
+                            if tok.pos_ != "VERB" or not tok.tag_.startswith("VB"):
+                                continue
+                            if tok.tag_ == "VBN":
+                                return tok
+                        return None
+
+                    # Special-case passive tasks: spaCy doesn't expose the underlying
+                    # transitivity after passivization, so force a transitive frame
+                    # for the good sentence and an intransitive frame for the bad
+                    # sentence to preserve the intended violation.
+                    if cfg in {"passive_1", "passive_2"}:
+                        g_head = _find_passive_head(gdoc_working)
+                        b_head = _find_passive_head(bdoc_working)
+                        if g_head is not None and b_head is not None:
+                            rng_good = random.Random(pair_seed - 1)
+                            rng_bad = random.Random(pair_seed - 2)
+                            g_forced = [{
+                                "i": g_head.i,
+                                "tag": g_head.tag_,
+                                "frame": "trans",
+                                "lemma": g_head.lemma_.lower(),
+                                "prep_i": None,
+                                "particle_i": None,
+                                "that_clause": False,
+                            }]
+                            b_forced = [{
+                                "i": b_head.i,
+                                "tag": b_head.tag_,
+                                "frame": "intr",
+                                "lemma": b_head.lemma_.lower(),
+                                "prep_i": None,
+                                "particle_i": None,
+                                "that_clause": False,
+                            }]
+                            g_verb_variant, g_verb_swaps = verb_swap_all(
+                                gdoc_working,
+                                verb_inventory_obj,
+                                transitivity_inventory=verb_inventory_transitivity,
+                                verb_mode="all",
+                                k=1,
+                                zipf_thr=verb_zipf_thr,
+                                zipf_weighted=zipf_weighted_sampling,
+                                zipf_temp=zipf_temp,
+                                rng=rng_good,
+                                forced_targets=g_forced,
+                            )
+                            b_verb_variant, b_verb_swaps = verb_swap_all(
+                                bdoc_working,
+                                verb_inventory_obj,
+                                transitivity_inventory=verb_inventory_transitivity,
+                                verb_mode="all",
+                                k=1,
+                                zipf_thr=verb_zipf_thr,
+                                zipf_weighted=zipf_weighted_sampling,
+                                zipf_temp=zipf_temp,
+                                rng=rng_bad,
+                                forced_targets=b_forced,
+                            )
+                            if not (
+                                g_verb_variant
+                                and b_verb_variant
+                                and g_verb_swaps
+                                and b_verb_swaps
+                                and len(g_verb_swaps) == len(b_verb_swaps)
+                            ):
+                                g_verb_swaps = []
+                                b_verb_swaps = []
+                            else:
+                                g_variant = g_verb_variant
+                                b_variant = b_verb_variant
+                                verb_changed = True
+                                gdoc_working = nlp(g_variant)
+                                bdoc_working = nlp(b_variant)
+                            # Skip the generic verb-swap logic for passives when
+                            # the forced-swap path succeeds.
+                            g_verb_candidates = []
+                            b_verb_candidates = []
+                        else:
+                            # Fallback when we can't locate a passive head.
+                            g_verb_candidates = candidate_verbs(gdoc_working)
+                            g_verb_candidates.sort(key=lambda t: t.token.i)
+                            b_verb_candidates = candidate_verbs(bdoc_working)
+                            b_verb_candidates.sort(key=lambda t: t.token.i)
+                    else:
+                        g_verb_candidates = candidate_verbs(gdoc_working)
+                        g_verb_candidates.sort(key=lambda t: t.token.i)
+                        b_verb_candidates = candidate_verbs(bdoc_working)
+                        b_verb_candidates.sort(key=lambda t: t.token.i)
 
                     verb_matches = []
                     used_bad_verbs = set()
@@ -487,17 +629,39 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                     b_target_specs = []
                     if verb_matches:
                         if is_control_raising and matched_by_identity and not unmatched_good and not unmatched_bad:
-                            verb_matches = []
+                            pass
                         else:
                             for g_spec, b_spec in verb_matches:
                                 g_entry = dict(g_spec)
                                 b_entry = dict(b_spec)
                                 g_entry["that_clause"] = bool(g_spec.get("that_clause"))
                                 b_entry["that_clause"] = bool(b_spec.get("that_clause"))
+
+                                # Argument-structure subtasks often encode the
+                                # grammaticality contrast via (mis)matching a
+                                # verb's transitivity with its surface arguments.
+                                # When the Good/Bad verbs differ, enforce the
+                                # intended transitivity class so swaps preserve
+                                # the violation.
+                                if phenomenon == "argument_structure" and g_spec.get("lemma") != b_spec.get("lemma"):
+                                    if cfg in {"causative", "transitive"}:
+                                        g_entry["frame"] = "trans"
+                                        b_entry["frame"] = "intr"
+                                    elif cfg in {"inchoative", "intransitive"}:
+                                        b_entry["frame"] = "trans"
+                                    elif cfg == "drop_argument":
+                                        # If the bad sentence strands a preposition (e.g., "talk to ."),
+                                        # keep intr_pp; otherwise force a transitive verb with its object dropped.
+                                        b_frame = str(b_entry.get("frame") or "")
+                                        if not b_frame.startswith("intr_pp"):
+                                            b_entry["frame"] = "trans"
+
                                 g_target_specs.append(g_entry)
                                 b_target_specs.append(b_entry)
                         rng_verbs = random.Random(pair_seed - 1)
                         if is_control_raising:
+                            g_verb_variant = None
+                            b_verb_variant = None
                             raising_pool = _filter_pool_with_fallback(_RAISING_VERBS, verb_zipf_thr)
                             control_pool = _filter_pool_with_fallback(control_verb_pool or _RAISING_VERBS, verb_zipf_thr)
                             same_g_specs, same_b_specs = [], []
@@ -606,6 +770,54 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                             else:
                                 g_verb_variant = None
                                 b_verb_variant = None
+                            # If the control/raising-specific path fails (often due to
+                            # misparses or pool/constraint mismatches), fall back to the
+                            # generic inventory-driven verb swap so we still get a rare
+                            # variant when possible.
+                            if g_verb_variant is None or b_verb_variant is None:
+                                g_verb_variant, g_verb_swaps = verb_swap_all(
+                                    gdoc_working,
+                                    verb_inventory_obj,
+                                    transitivity_inventory=verb_inventory_transitivity,
+                                    verb_mode=verb_mode,
+                                    k=k,
+                                    zipf_thr=verb_zipf_thr,
+                                    zipf_weighted=zipf_weighted_sampling,
+                                    zipf_temp=zipf_temp,
+                                    rng=rng_verbs,
+                                    forced_targets=g_target_specs,
+                                )
+                                b_verb_variant = None
+                                if g_verb_variant and g_verb_swaps and len(b_target_specs) == len(g_verb_swaps):
+                                    b_seed = pair_seed - 1 if matched_by_identity else pair_seed - 2
+                                    b_verb_variant, b_verb_swaps = verb_swap_all(
+                                        bdoc_working,
+                                        verb_inventory_obj,
+                                        transitivity_inventory=verb_inventory_transitivity,
+                                        verb_mode=verb_mode,
+                                        k=k,
+                                        zipf_thr=verb_zipf_thr,
+                                        zipf_weighted=zipf_weighted_sampling,
+                                        zipf_temp=zipf_temp,
+                                        rng=random.Random(b_seed),
+                                        forced_targets=b_target_specs,
+                                    )
+
+                            if not (
+                                g_verb_variant
+                                and b_verb_variant
+                                and g_verb_swaps
+                                and b_verb_swaps
+                                and len(g_verb_swaps) == len(b_verb_swaps)
+                            ):
+                                g_verb_swaps = []
+                                b_verb_swaps = []
+                            else:
+                                g_variant = g_verb_variant
+                                b_variant = b_verb_variant
+                                verb_changed = True
+                                gdoc_working = nlp(g_variant)
+                                bdoc_working = nlp(b_variant)
                         else:
                             g_verb_variant, g_verb_swaps = verb_swap_all(
                                 gdoc_working,
@@ -651,21 +863,21 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                         forced_targets=b_target_specs,
                                         override_specs=override_specs or None,
                                     )
-                        if not (
-                            g_verb_variant
-                            and b_verb_variant
-                            and g_verb_swaps
-                            and b_verb_swaps
-                            and len(g_verb_swaps) == len(b_verb_swaps)
-                        ):
-                            g_verb_swaps = []
-                            b_verb_swaps = []
-                        else:
-                            g_variant = g_verb_variant
-                            b_variant = b_verb_variant
-                            verb_changed = True
-                            gdoc_working = nlp(g_variant)
-                            bdoc_working = nlp(b_variant)
+                            if not (
+                                g_verb_variant
+                                and b_verb_variant
+                                and g_verb_swaps
+                                and b_verb_swaps
+                                and len(g_verb_swaps) == len(b_verb_swaps)
+                            ):
+                                g_verb_swaps = []
+                                b_verb_swaps = []
+                            else:
+                                g_variant = g_verb_variant
+                                b_variant = b_verb_variant
+                                verb_changed = True
+                                gdoc_working = nlp(g_variant)
+                                bdoc_working = nlp(b_variant)
 
                 # Stage 1: noun swaps
                 if do_noun_swaps:
@@ -794,12 +1006,21 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                             bdoc_working = nlp(b_variant)
 
                 # Stage 2: adjective swaps (operates on the noun-swapped text)
-                if do_adj_swaps:
+                if do_adj_swaps and phenomenon != "irregular_forms":
                     adj_good_pool = rare_adj_pool
                     adj_bad_pool = rare_adj_pool
                     if is_control_raising:
-                        adj_good_pool = _filter_pool_with_fallback(_RAISING_ADJECTIVES, adj_zipf_thr)
-                        adj_bad_pool = _filter_pool_with_fallback(_CONTROL_ADJECTIVES, adj_zipf_thr)
+                        raising_adj_pool = _filter_pool_with_fallback(_RAISING_ADJECTIVES, adj_zipf_thr)
+                        control_adj_pool = _filter_pool_with_fallback(_CONTROL_ADJECTIVES, adj_zipf_thr)
+                        if str(cfg).startswith("tough_vs_raising"):
+                            # In tough-vs-raising subtasks, the grammatical (good)
+                            # sentence is the "tough"/control-like form and the
+                            # ungrammatical (bad) sentence is the raising form.
+                            adj_good_pool = control_adj_pool
+                            adj_bad_pool = raising_adj_pool
+                        else:
+                            adj_good_pool = raising_adj_pool
+                            adj_bad_pool = control_adj_pool
                     gdoc_adj = gdoc_working
                     bdoc_adj = bdoc_working
                     # Detect adjective targets on the original parse so noun swaps
@@ -1035,6 +1256,20 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                     good_rare_val = g_variant
                     bad_rare_val = b_variant
 
+                swap_failed_reason = None
+                if good_rare_val and bad_rare_val and good_rare_val == bad_rare_val:
+                    # Rare variants must preserve the good/bad contrast. When swapping
+                    # collapses the pair, drop the rare variants and record the reason.
+                    good_rare_val = None
+                    bad_rare_val = None
+                    g_swaps, b_swaps = [], []
+                    g_adj_swaps, b_adj_swaps = [], []
+                    g_verb_swaps, b_verb_swaps = [], []
+                    verb_changed = False
+                    noun_changed = False
+                    adj_changed = False
+                    swap_failed_reason = "pair_collapsed"
+
                 records.append({
                     "group": group_name,
                     "phenomenon": phenomenon,
@@ -1062,6 +1297,7 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                         "verb_swapped": verb_changed,
                         "noun_swapped": noun_changed,
                         "adj_swapped": adj_changed,
+                        "swap_failed_reason": swap_failed_reason,
                         "req_good": req_g,
                         "req_bad": req_b
                     }
