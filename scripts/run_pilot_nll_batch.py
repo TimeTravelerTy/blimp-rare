@@ -136,7 +136,7 @@ def _score_dataset(
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Batch NLL scoring over all pilot tier A JSONL datasets in data/processed."
+        description="Batch NLL scoring over all datasets in data/processed."
     )
     ap.add_argument("--pattern", default="data/processed/*rare_blimp*.jsonl", help="Glob pattern for datasets.")
     ap.add_argument("--model", default="microsoft/phi-2")
