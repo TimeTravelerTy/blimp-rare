@@ -7,6 +7,7 @@ from typing import Optional
 from sentence_nll_qc import (
     VARIANTS,
     LlamaNLLScorer,
+    _SENTENCE_NLL_IMPORT_ERROR,
     _aggregate_by_variant,
     _build_items,
     _good_bad_stats,
@@ -37,12 +38,13 @@ def _score_dataset(
     batch_size: int,
     max_length: int,
     limit: Optional[int],
+    limit_strategy: str,
     model: str,
     device: Optional[str],
     dtype: str,
     out_dir: Path,
 ) -> Path:
-    records = load_records(str(data_path), limit)
+    records = load_records(str(data_path), limit, limit_strategy=limit_strategy)
     if not records:
         raise RuntimeError(f"No records loaded from {data_path}")
     items = _build_items(records)
@@ -141,6 +143,12 @@ def main():
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--max-length", type=int, default=64)
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument(
+        "--limit-strategy",
+        default="proportional-subtask",
+        choices=["head", "proportional-subtask"],
+        help="How to apply --limit: take first N records (head) or allocate N proportionally across subtasks.",
+    )
     ap.add_argument("--device", default=None)
     ap.add_argument("--dtype", default="auto", choices=["auto", "bfloat16", "float16", "float32"])
     ap.add_argument("--device-map", default=None)
@@ -151,6 +159,12 @@ def main():
         help="Directory for per-dataset output JSON files.",
     )
     args = ap.parse_args()
+
+    if LlamaNLLScorer is None:
+        raise SystemExit(
+            f"Failed to import model scorer (missing dependency?): {_SENTENCE_NLL_IMPORT_ERROR}. "
+            "Install requirements (e.g., torch/transformers) to run scoring."
+        )
 
     paths = sorted(Path(p) for p in Path().glob(args.pattern) if p.is_file())
     if not paths:
@@ -174,6 +188,7 @@ def main():
             batch_size=args.batch_size,
             max_length=args.max_length,
             limit=args.limit,
+            limit_strategy=args.limit_strategy,
             model=args.model,
             device=args.device,
             dtype=args.dtype,

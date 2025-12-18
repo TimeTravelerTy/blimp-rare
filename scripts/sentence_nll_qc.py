@@ -9,7 +9,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from src.sentence_nll import LlamaNLLScorer  # noqa: E402
+try:
+    from src.sentence_nll import LlamaNLLScorer  # noqa: E402
+except ModuleNotFoundError as e:  # pragma: no cover
+    LlamaNLLScorer = None  # type: ignore[assignment]
+    _SENTENCE_NLL_IMPORT_ERROR = e
+else:  # pragma: no cover
+    _SENTENCE_NLL_IMPORT_ERROR = None
 
 
 Variant = str
@@ -30,8 +36,11 @@ def _median(xs: List[float]) -> float:
     return float((sorted_xs[mid - 1] + sorted_xs[mid]) / 2)
 
 
-def load_records(path: str, limit: Optional[int] = None) -> List[dict]:
-    records = []
+def _subtask_key(rec: dict) -> str:
+    return str(rec.get("subtask") or "unknown")
+
+
+def _iter_jsonl(path: str):
     with open(path, encoding="utf-8") as f:
         for i, line in enumerate(f):
             if not line.strip():
@@ -41,9 +50,68 @@ def load_records(path: str, limit: Optional[int] = None) -> List[dict]:
             except json.JSONDecodeError:
                 continue
             rec["_row"] = i
+            yield rec
+
+
+def _alloc_proportional(total_limit: int, counts: Dict[str, int]) -> Dict[str, int]:
+    total = sum(counts.values())
+    if total <= 0 or total_limit <= 0:
+        return {k: 0 for k in counts}
+
+    raw = {k: (total_limit * (v / total)) for k, v in counts.items()}
+    floors = {k: int(raw[k]) for k in raw}
+    remainder = total_limit - sum(floors.values())
+
+    if remainder > 0:
+        ranked = sorted(
+            raw.keys(),
+            key=lambda k: (raw[k] - floors[k], counts[k], k),
+            reverse=True,
+        )
+        for k in ranked[:remainder]:
+            floors[k] += 1
+
+    return floors
+
+
+def load_records(
+    path: str,
+    limit: Optional[int] = None,
+    limit_strategy: str = "head",
+) -> List[dict]:
+    if limit is None:
+        return list(_iter_jsonl(path))
+
+    if limit_strategy not in ("head", "proportional-subtask"):
+        raise ValueError(f"Unknown limit_strategy={limit_strategy!r}")
+
+    if limit_strategy == "head":
+        records: List[dict] = []
+        for rec in _iter_jsonl(path):
             records.append(rec)
-            if limit is not None and len(records) >= limit:
+            if len(records) >= limit:
                 break
+        return records
+
+    counts: Dict[str, int] = defaultdict(int)
+    total = 0
+    for rec in _iter_jsonl(path):
+        counts[_subtask_key(rec)] += 1
+        total += 1
+    if limit >= total:
+        return list(_iter_jsonl(path))
+
+    quotas = _alloc_proportional(limit, counts)
+    picked: Dict[str, int] = defaultdict(int)
+    records = []
+    for rec in _iter_jsonl(path):
+        subtask = _subtask_key(rec)
+        if picked[subtask] >= quotas.get(subtask, 0):
+            continue
+        picked[subtask] += 1
+        records.append(rec)
+        if len(records) >= limit:
+            break
     return records
 
 
@@ -269,6 +337,12 @@ def main():
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--max-length", type=int, default=256)
     ap.add_argument("--limit", type=int, default=None, help="Optional limit on number of records to score.")
+    ap.add_argument(
+        "--limit-strategy",
+        default="head",
+        choices=["head", "proportional-subtask"],
+        help="How to apply --limit: take first N records (head) or allocate N proportionally across subtasks.",
+    )
     ap.add_argument("--device", default=None, help="torch device (default: cuda if available).")
     ap.add_argument("--dtype", default="auto", choices=["auto", "bfloat16", "float16", "float32"])
     ap.add_argument(
@@ -284,7 +358,13 @@ def main():
     )
     args = ap.parse_args()
 
-    records = load_records(args.data, args.limit)
+    if LlamaNLLScorer is None:
+        raise SystemExit(
+            f"Failed to import model scorer (missing dependency?): {_SENTENCE_NLL_IMPORT_ERROR}. "
+            "Install requirements (e.g., torch/transformers) to run scoring."
+        )
+
+    records = load_records(args.data, args.limit, limit_strategy=args.limit_strategy)
     print(f"Loaded {len(records)} records from {args.data}.")
     items = _build_items(records)
     print(f"Scoring {len(items)} variants across {len(VARIANTS)} buckets...")
