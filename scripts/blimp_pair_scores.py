@@ -79,16 +79,6 @@ def _swap_counts(meta: dict) -> Dict[str, int]:
     }
 
 
-def _zipf_aggs(meta: dict) -> dict:
-    keys = [
-        "zipf_swapped_position_aggregates",
-        "zipf_swapped_position_deltas",
-        "zipf_swapped_object_aggregates",
-        "zipf_swapped_object_deltas",
-    ]
-    return {k: meta.get(k) for k in keys if k in meta}
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Score BLiMP/rare-BLiMP pairs and save per-pair logprob data."
@@ -194,7 +184,6 @@ def main() -> None:
             good_score = scores[2 * i]
             bad_score = scores[2 * i + 1]
             row = {
-                "row": rec.get("_row"),
                 "idx": rec.get("idx"),
                 "group": rec.get("group"),
                 "phenomenon": rec.get("phenomenon"),
@@ -206,12 +195,9 @@ def main() -> None:
                 "bad_text": rec.get(bad_field),
                 "good_total_nll": good_score.total_nll,
                 "bad_total_nll": bad_score.total_nll,
-                "good_logprob": -good_score.total_nll,
-                "bad_logprob": -bad_score.total_nll,
                 "good_token_count": good_score.token_count,
                 "bad_token_count": bad_score.token_count,
                 "swap_counts": _swap_counts(meta),
-                "zipf_aggs": _zipf_aggs(meta),
             }
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
