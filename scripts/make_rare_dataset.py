@@ -65,6 +65,12 @@ def _default_out_path(args) -> Path:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--tier_cfg", default="configs/blimp_all.yaml")
+    ap.add_argument(
+        "--phenomenon",
+        action="append",
+        default=None,
+        help="Limit generation to a single phenomenon (repeatable).",
+    )
     ap.add_argument("--becl_path", default="data/external/becl_lemma.tsv")
     ap.add_argument("--quant_cfg", default="configs/quantifier_map.yaml")
     ap.add_argument(
@@ -221,6 +227,7 @@ if __name__ == "__main__":
                 verb_inventory=verb_inventory_obj,
                 seed=args.seed,
                 record_limit=args.limit,
+                phenomenon_filter=args.phenomenon,
                 exclude_proper_nouns=args.exclude_proper_nouns,
                 gender_lexicon_path=args.gender_lexicon,
                 zipf_weighted_sampling=args.zipf_weighted_sampling,

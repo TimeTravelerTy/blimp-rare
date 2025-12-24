@@ -806,7 +806,7 @@ def candidate_nouns(doc, reflexive_subjects=None):
             continue
         if not t.is_alpha or len(t.text) <= 2:
             continue
-        if t.ent_type_:
+        if t.ent_type_ and t.text[:1].isupper():
             continue
         if t.dep_ == "ROOT" or t.dep_ == "relcl":
             continue

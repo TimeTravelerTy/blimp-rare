@@ -29,6 +29,12 @@ _POS_ALIASES = {
 
 _WORD_RE = re.compile(r"^[a-z]+$")
 _PERSON_SUFFIXES = ("ist", "er", "or", "phile", "ian", "man", "woman")
+_PERSON_DEF_RE = re.compile(
+    r"^(?:\\([^)]*\\)\\s*)?(?:an?|the|one|someone|somebody)\\s+"
+    r"(?:person|people|man|woman|boy|girl|child|adult|human|individual|worker|agent|professional|employee|practitioner|specialist)\\b"
+    r"(?:\\s+(?:who|that|whose)\\b)?",
+    re.IGNORECASE,
+)
 _PERSON_DOMAIN = "noun.person"
 _LOCATION_DOMAIN = "noun.location"
 _TIME_DOMAIN = "noun.time"
@@ -285,6 +291,25 @@ def _is_person_noun_cached(lemma: str, lexicon: str) -> bool:
     return _lemma_has_domain(lemma, lexicon, _PERSON_DOMAIN)
 
 
+@lru_cache(maxsize=4096)
+def _is_person_definition_cached(lemma: str, lexicon: str) -> bool:
+    if not lemma:
+        return False
+    _load_lexicon(lexicon)
+    try:
+        synsets = wn.synsets(lemma, pos="n", lexicon=lexicon)
+    except Exception:
+        return False
+    for syn in synsets or ():
+        try:
+            definition = syn.definition()
+        except Exception:
+            definition = None
+        if definition and _PERSON_DEF_RE.search(str(definition).strip()):
+            return True
+    return False
+
+
 def is_person_noun(lemma: str, *, lexicon: str = _DEFAULT_LEXICON) -> bool:
     """
     Return True if WordNet marks the noun lemma as a person-denoting concept.
@@ -292,9 +317,11 @@ def is_person_noun(lemma: str, *, lexicon: str = _DEFAULT_LEXICON) -> bool:
     norm = (lemma or "").strip().lower()
     if not norm:
         return False
-    if any(norm.endswith(sfx) for sfx in _PERSON_SUFFIXES):
+    if _is_person_noun_cached(norm, lexicon):
         return True
-    return _is_person_noun_cached(norm, lexicon)
+    if any(norm.endswith(sfx) for sfx in _PERSON_SUFFIXES):
+        return _is_person_definition_cached(norm, lexicon)
+    return False
 
 
 @lru_cache(maxsize=4096)

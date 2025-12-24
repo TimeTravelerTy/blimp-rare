@@ -1,5 +1,5 @@
 import random, spacy, yaml, time
-from typing import Optional
+from typing import Optional, Sequence
 from pathlib import Path
 from spacy.lang.en.stop_words import STOP_WORDS as _STOP_WORDS
 from wordfreq import zipf_frequency
@@ -298,6 +298,7 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                 verbiness_lexicon: str = "oewn:2021",
                 swap_targets=("nouns",), seed=0, show_progress=True,
                 record_limit: Optional[int] = None,
+                phenomenon_filter: Optional[Sequence[str]] = None,
                 exclude_proper_nouns: bool = True,
                 rare_name_path="data/external/rare_names.tsv",
                 name_lookup_path="data/external/name_gender_lookup.tsv",
@@ -466,9 +467,21 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
 
     # Build a lightweight config list (don't load every BLiMP subdataset up
     # front; that can be slow, especially when record_limit is small).
+    allowed_phenomena = None
+    if phenomenon_filter:
+        allowed_phenomena = {
+            str(entry).strip().lower()
+            for entry in phenomenon_filter
+            if entry and str(entry).strip()
+        }
     cfg_list = []
     for group_name, meta in (tasks_cfg or {}).items():
         phenomenon = meta["phenomenon"]
+        if allowed_phenomena:
+            group_key = str(group_name).strip().lower()
+            phen_key = str(phenomenon).strip().lower()
+            if group_key not in allowed_phenomena and phen_key not in allowed_phenomena:
+                continue
         configs = meta.get("configs", [])
         if not configs:
             continue
@@ -1119,6 +1132,75 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                     rare_person_lemmas=rare_person_pool,
                                     rare_gender_lemmas=rare_gender_map,
                                     override_lemmas=lemmas,
+                                    reflexive_subjects=b_reflexive_subjects,
+                                )
+                        if not (
+                            g_rare
+                            and b_rare
+                            and g_swaps
+                            and b_swaps
+                            and len(g_swaps) == len(b_swaps)
+                        ):
+                            g_rare = None
+                            b_rare = None
+                            g_swaps = []
+                            b_swaps = []
+                        else:
+                            g_variant = g_rare
+                            b_variant = b_rare
+                            noun_changed = True
+                            gdoc_working = nlp(g_variant)
+                            bdoc_working = nlp(b_variant)
+                    elif phenomenon == "s-selection" and g_candidates and b_candidates:
+                        if noun_mode == "k":
+                            g_candidates = g_candidates[:max(0, min(k, len(g_candidates)))]
+                            b_candidates = b_candidates[:max(0, min(k, len(b_candidates)))]
+
+                        def _build_unmatched_targets(candidates, reflexive_meta):
+                            targets = []
+                            for tok in candidates:
+                                reflexive_info = reflexive_meta.get(tok.i) if isinstance(reflexive_meta, dict) else None
+                                require_gender = _required_gender(tok, reflexive_meta, gender_lex)
+                                require_person = bool(require_gender) or (reflexive_info.get("animate") if reflexive_info else False)
+                                if not require_person and is_person_noun(tok.lemma_.lower()):
+                                    require_person = True
+                                targets.append({
+                                    "i": tok.i,
+                                    "tag": _noun_target_tag(tok),
+                                    "require_person": require_person,
+                                    "require_gender": require_gender,
+                                })
+                            return targets
+
+                        g_target_specs = _build_unmatched_targets(g_candidates, g_reflexive_subjects)
+                        b_target_specs = _build_unmatched_targets(b_candidates, b_reflexive_subjects)
+                        g_rare = None
+                        b_rare = None
+
+                        if g_target_specs and b_target_specs:
+                            g_rare, g_swaps = noun_swap_all(
+                                gdoc_working, rare_pool,
+                                noun_mode=noun_mode, k=k, zipf_thr=None,
+                                zipf_weighted=zipf_weighted_sampling,
+                                zipf_temp=zipf_temp,
+                                becl_map=becl_map, req=req_g, rng=random.Random(pair_seed),
+                                forced_targets=g_target_specs,
+                                rare_person_lemmas=rare_person_pool,
+                                rare_gender_lemmas=rare_gender_map,
+                                reflexive_subjects=g_reflexive_subjects,
+                            )
+                            b_rare = None
+                            if g_rare and g_swaps:
+                                b_rare, b_swaps = noun_swap_all(
+                                    bdoc_working, rare_pool,
+                                    noun_mode=noun_mode, k=k, zipf_thr=None,
+                                    zipf_weighted=zipf_weighted_sampling,
+                                    zipf_temp=zipf_temp,
+                                    becl_map=becl_map, req=req_b,
+                                    rng=random.Random(pair_seed - 1),
+                                    forced_targets=b_target_specs,
+                                    rare_person_lemmas=rare_person_pool,
+                                    rare_gender_lemmas=rare_gender_map,
                                     reflexive_subjects=b_reflexive_subjects,
                                 )
                         if not (
