@@ -125,7 +125,7 @@ def main() -> None:
     ap.add_argument("--hf-split", default="train", help="HF split name (default: train).")
     ap.add_argument("--limit", type=int, default=None, help="Optional limit on number of records.")
     ap.add_argument("--model", default="meta-llama/Meta-Llama-3-8B")
-    ap.add_argument("--batch-size", type=int, default=8)
+    ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--max-length", type=int, default=256)
     ap.add_argument("--device", default=None)
     ap.add_argument("--dtype", default="auto", choices=["auto", "float16", "bfloat16", "float32"])
