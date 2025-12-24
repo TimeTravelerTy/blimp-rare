@@ -1466,8 +1466,12 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                 adj_changed = True
 
                 if not (verb_changed or noun_changed or adj_changed):
-                    good_rare_val = None
-                    bad_rare_val = None
+                    if phenomenon == "irregular_forms":
+                        good_rare_val = g
+                        bad_rare_val = b
+                    else:
+                        good_rare_val = None
+                        bad_rare_val = None
                 else:
                     good_rare_val = g_variant
                     bad_rare_val = b_variant
