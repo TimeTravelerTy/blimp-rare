@@ -131,6 +131,7 @@ def _write_variant(
     good_field: Optional[str],
     bad_field: Optional[str],
     data_path: Path,
+    model: str,
     args,
     run_ts: str,
     out_dir: Path,
@@ -152,7 +153,7 @@ def _write_variant(
     if not texts:
         raise ValueError("No valid good/bad pairs found.")
 
-    out_path = _default_out_path(args.model, str(data_path), variant, run_ts, out_dir)
+    out_path = _default_out_path(model, str(data_path), variant, run_ts, out_dir)
     if out_path.exists() and not args.overwrite:
         print(f"[Skip] {out_path} already exists.")
         return None
@@ -311,6 +312,7 @@ def main() -> None:
                     args.good_field,
                     args.bad_field,
                     data_path,
+                    model,
                     args,
                     run_ts,
                     out_dir,
@@ -324,6 +326,7 @@ def main() -> None:
                     args.good_field,
                     args.bad_field,
                     data_path,
+                    model,
                     args,
                     run_ts,
                     out_dir,
@@ -338,6 +341,7 @@ def main() -> None:
                     args.good_field,
                     args.bad_field,
                     data_path,
+                    model,
                     args,
                     run_ts,
                     out_dir,
