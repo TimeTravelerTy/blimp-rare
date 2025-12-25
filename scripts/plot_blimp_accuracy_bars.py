@@ -31,23 +31,48 @@ def _strip_ts_suffix(text: Optional[str]) -> Optional[str]:
     return text
 
 
+def _strip_leading_timestamps(text: str) -> str:
+    # Drop one or more leading timestamps separated by underscores.
+    out = text
+    while True:
+        m = _TS_RE.match(out)
+        if m and out.startswith(f"{m.group(0)}_"):
+            out = out[len(m.group(0)) + 1 :]
+        else:
+            break
+    return out
+
+
+def _strip_pair_suffixes(stem: str) -> str:
+    suffixes = [
+        "_pair-scores_accuracy",
+        "_pair-scores-accuracy",
+        "_pair-scores_pair-scores-accuracy",
+        "_pair-scores",
+    ]
+    out = stem
+    for suf in suffixes:
+        if out.endswith(suf):
+            out = out[: -len(suf)]
+    return out
+
+
 def _parse_scores_name(path: Path) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
-    stem = path.stem
-    if stem.endswith("_pair-scores"):
-        stem = stem[: -len("_pair-scores")]
+    stem = _strip_pair_suffixes(path.stem)
 
     variant = None
-    for cand in ("rare", "original", "auto", "both"):
-        if stem.endswith(f"_{cand}"):
-            variant = cand
-            stem = stem[: -(len(cand) + 1)]
-            break
+    m_variant = re.search(r"_(rare|original|auto|both)$", stem)
+    if m_variant:
+        variant = m_variant.group(1)
+        stem = stem[: m_variant.start()]
 
     ts = _parse_timestamp(stem)
     if ts and stem.startswith(f"{ts}_"):
         rest = stem[len(ts) + 1 :]
     else:
         rest = stem
+
+    rest = _strip_leading_timestamps(rest)
 
     model = None
     data = None
@@ -192,6 +217,8 @@ def main() -> None:
     ax.set_xticks(group_positions)
     ax.set_xticklabels(wanted_groups, rotation=0, ha="center")
     ax.set_ylim(0.0, 1.0)
+    ax.yaxis.grid(True, linestyle="--", alpha=0.4)
+    ax.set_axisbelow(True)
     if args.title:
         ax.set_title(args.title)
     ax.legend(title="Model", fontsize=9)
