@@ -94,7 +94,7 @@ def _parse_scores_name(path: Path) -> Tuple[Optional[str], Optional[str], Option
 def _group_label(data_slug: Optional[str]) -> Optional[str]:
     if not data_slug:
         return None
-    if "zipf" not in data_slug:
+    if "original_pair" in data_slug or data_slug.endswith("original"):
         return "original dataset"
     match = re.search(r"zipf(?P<low>\d+_\d+)-(?P<high>\d+_\d+)", data_slug)
     if not match:
@@ -112,6 +112,24 @@ def _group_label(data_slug: Optional[str]) -> Optional[str]:
 
 def _display_model(model: str) -> str:
     return model.replace("_", ".")
+
+
+def _infer_group_from_stem(stem: str) -> Optional[str]:
+    if "original_pair" in stem or stem.endswith("original"):
+        return "original dataset"
+    # Look for any zipf window anywhere in the stem.
+    m = re.search(r"zipf(?P<low>\d+_\d+)-(?P<high>\d+_\d+)", stem)
+    if m:
+        low = m.group("low").replace("_", ".")
+        high = m.group("high").replace("_", ".")
+        window = f"{low}-{high}"
+        mapping = {
+            "4.0-5.2": "4.0-5.2: head",
+            "2.2-3.0": "2.2-3.0: tail",
+            "1.2-2.0": "1.2-2.0: xtail",
+        }
+        return mapping.get(window, window)
+    return "original dataset"
 
 
 def _load_runs(runs_dir: Path, pattern: str) -> List[dict]:
@@ -176,10 +194,16 @@ def main() -> None:
             continue
         scores_path = obj.get("scores_path")
         if scores_path:
-            model, data, _variant, ts = _parse_scores_name(Path(scores_path))
+            parsed_path = Path(scores_path)
+            model, data, _variant, ts = _parse_scores_name(parsed_path)
         else:
-            model, data, _variant, ts = _parse_scores_name(obj["_path"])
-        group = _group_label(data)
+            parsed_path = obj["_path"]
+            model, data, _variant, ts = _parse_scores_name(parsed_path)
+
+        group = _group_label(data) if data is not None else None
+        if group is None:
+            group = _infer_group_from_stem(parsed_path.stem)
+
         if not model or not group:
             continue
         if group not in wanted_groups:
