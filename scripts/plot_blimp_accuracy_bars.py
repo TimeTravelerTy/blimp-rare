@@ -85,6 +85,10 @@ def _group_label(data_slug: Optional[str]) -> Optional[str]:
     return mapping.get(window, window)
 
 
+def _display_model(model: str) -> str:
+    return model.replace("_", ".")
+
+
 def _load_runs(runs_dir: Path, pattern: str) -> List[dict]:
     runs = []
     for path in sorted(runs_dir.glob(pattern)):
@@ -201,5 +205,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-def _display_model(model: str) -> str:
-    return model.replace("_", ".")
