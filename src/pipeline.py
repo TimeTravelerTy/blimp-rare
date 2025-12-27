@@ -58,10 +58,98 @@ def _print_progress(done, total, start_time, last_update, width=30):
 
 _ACRONYM_VOWELS = set("aeiou")
 
-_RAISING_VERBS = [
+_SUBJECT_RAISING_VERBS = [
     "seem", "appear", "happen", "tend", "look", "prove", "remain", "continue",
     "begin", "start", "stop", "fail", "threaten", "promise", "cease", "come",
     "grow", "commence", "chance", "transpire", "hap",
+    "bid_fair", "loom", "deserve",
+]
+
+_OBJECT_RAISING_VERBS = [
+    "want",
+    "need",
+    "like",
+    "expect",
+    "hate",
+    "prefer",
+    "mean",
+    "wish",
+    "imagine",
+    "guess",
+    "suppose",
+    "reckon",
+    "believe",
+    "find",
+    "feel",
+    "know",
+    "consider",
+    "allow",
+    "cause",
+    "understand",
+    "assume",
+    "presume",
+    "suspect",
+    "claim",
+    "maintain",
+    "declare",
+    "state",
+    "report",
+    "judge",
+    "hold",
+    "deem",
+    "view",
+    "perceive",
+    "observe",
+    "note",
+    "reveal",
+    "prove",
+    "show",
+    "require",
+    "permit",
+    "order",
+    "command",
+    "forbid",
+    "authorize",
+    "intend",
+    "discover",
+    "estimate",
+    "calculate",
+    "acknowledge",
+    "admit",
+    "affirm",
+    "allege",
+    "anticipate",
+    "apprehend",
+    "ascertain",
+    "assert",
+    "avow",
+    "certify",
+    "conceive",
+    "conjecture",
+    "deduce",
+    "demonstrate",
+    "determine",
+    "discern",
+    "enable",
+    "envisage",
+    "envision",
+    "foresee",
+    "grant",
+    "guarantee",
+    "hypothesize",
+    "infer",
+    "posit",
+    "postulate",
+    "predict",
+    "proclaim",
+    "pronounce",
+    "recognize",
+    "recollect",
+    "remember",
+    "stipulate",
+    "surmise",
+    "verify",
+    "warrant",
 ]
 
 _RAISING_ADJECTIVES = [
@@ -84,6 +172,114 @@ _CONTROL_ADJECTIVES = [
     "impatient", "intent", "disinclined", "indisposed", "solicitous",
     "studious", "importunate", "powerless", "impotent", "desperate",
     "resolved", "fain", "minded", "chary",
+]
+
+_TOUGH_ADJECTIVES = [
+    "easy",
+    "hard",
+    "fun",
+    "nice",
+    "good",
+    "bad",
+    "cool",
+    "great",
+    "safe",
+    "boring",
+    "weird",
+    "tough",
+    "simple",
+    "scary",
+    "sweet",
+    "pleasant",
+    "unpleasant",
+    "lovely",
+    "wonderful",
+    "terrible",
+    "horrible",
+    "awful",
+    "difficult",
+    "dangerous",
+    "impossible",
+    "interesting",
+    "exciting",
+    "amazing",
+    "relaxing",
+    "stressful",
+    "awkward",
+    "strange",
+    "tiring",
+    "painful",
+    "annoying",
+    "tricky",
+    "risky",
+    "useful",
+    "pointless",
+    "delightful",
+    "enjoyable",
+    "fascinating",
+    "engaging",
+    "entertaining",
+    "challenging",
+    "complicated",
+    "confusing",
+    "frustrating",
+    "exhausting",
+    "draining",
+    "demanding",
+    "intimidating",
+    "charming",
+    "refreshing",
+    "comforting",
+    "soothing",
+    "calming",
+    "satisfying",
+    "disappointing",
+    "disturbing",
+    "shocking",
+    "embarrassing",
+    "frightening",
+    "tedious",
+    "tiresome",
+    "dreadful",
+    "costly",
+    "wasteful",
+    "stimulating",
+    "enlightening",
+    "educational",
+    "informative",
+    "illuminating",
+    "effortless",
+    "breezy",
+    "laborious",
+    "arduous",
+    "burdensome",
+    "onerous",
+    "strenuous",
+    "exasperating",
+    "infuriating",
+    "maddening",
+    "monotonous",
+    "unbearable",
+    "intolerable",
+    "insufferable",
+    "excruciating",
+    "hazardous",
+    "treacherous",
+    "perilous",
+    "formidable",
+    "loathsome",
+    "repulsive",
+    "irksome",
+    "wearisome",
+    "cumbersome",
+    "unsettling",
+    "unnerving",
+    "disarming",
+    "invigorating",
+    "uplifting",
+    "edifying",
+    "fruitless",
+    "futile",
 ]
 
 def _control_raising_adj_targets(doc):
@@ -166,13 +362,54 @@ def _control_verb_pool(inventory):
     lemmas = []
     seen = set()
     for entry in inventory.entries:
-        for frame in entry.frames:
-            if frame.kind == "intr_pp" and (frame.prep or "").lower() == "to":
-                if entry.lemma not in seen:
-                    lemmas.append(entry.lemma)
-                    seen.add(entry.lemma)
-                break
+        if any(frame.kind == "trans" for frame in entry.frames):
+            if entry.lemma not in seen:
+                lemmas.append(entry.lemma)
+                seen.add(entry.lemma)
     return tuple(lemmas)
+
+
+def _raising_verb_list_for_cfg(cfg) -> Sequence[str]:
+    cfg_key = str(cfg or "").strip().lower()
+    if "object_raising" in cfg_key:
+        return _OBJECT_RAISING_VERBS
+    return _SUBJECT_RAISING_VERBS
+
+
+def _has_to_infinitive_xcomp(verb_tok) -> bool:
+    if verb_tok is None:
+        return False
+    for child in verb_tok.children:
+        if child.dep_ != "xcomp":
+            continue
+        if any(gc.text.lower() == "to" and gc.dep_ in {"aux", "mark"} for gc in child.children):
+            return True
+    return False
+
+
+def _mark_turn_out_as_raising(spec: dict, doc) -> None:
+    if not isinstance(spec, dict) or doc is None:
+        return
+    idx = spec.get("i")
+    particle_idx = spec.get("particle_i")
+    if not isinstance(idx, int) or not isinstance(particle_idx, int):
+        return
+    if idx < 0 or idx >= len(doc) or particle_idx < 0 or particle_idx >= len(doc):
+        return
+    verb_tok = doc[idx]
+    particle_tok = doc[particle_idx]
+    if verb_tok is None or particle_tok is None:
+        return
+    if verb_tok.lemma_.lower() != "turn":
+        return
+    if (particle_tok.text or "").strip().lower() != "out":
+        return
+    if not _has_to_infinitive_xcomp(verb_tok):
+        return
+    frame = str(spec.get("frame") or "")
+    if frame.endswith("_particle"):
+        spec["frame"] = frame[: -len("_particle")]
+    spec["drop_particle"] = True
 
 
 def _looks_like_acronym(token: str) -> bool:
@@ -279,14 +516,29 @@ def _normalize_swap_targets(targets):
 
 def _filter_pool_with_fallback(items, zipf_thr):
     """
-    Keep only lemmas that pass the zipf rarity check; if all are filtered out,
-    return the original pool so swapping can still proceed.
+    Keep only lemmas that pass the zipf rarity check; if the pool is too small,
+    relax the threshold incrementally instead of falling back to the full list.
     """
     pool = tuple(items or ())
     if not pool or zipf_thr is None:
         return pool
-    filtered = tuple(lemma for lemma in pool if is_rare_lemma(lemma, zipf_thr))
-    return filtered if filtered else pool
+    min_size = min(8, len(pool))
+    step = 0.3
+    max_steps = 6
+
+    best = tuple(lemma for lemma in pool if is_rare_lemma(lemma, zipf_thr))
+    if len(best) >= min_size:
+        return best
+
+    thr = zipf_thr
+    for _ in range(max_steps):
+        thr += step
+        cand = tuple(lemma for lemma in pool if is_rare_lemma(lemma, thr))
+        if len(cand) > len(best):
+            best = cand
+        if len(best) >= min_size:
+            break
+    return best
 
 
 def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
@@ -747,6 +999,11 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                         limit = max(0, min(k, len(verb_matches)))
                         verb_matches = verb_matches[:limit]
 
+                    if is_control_raising and verb_matches:
+                        for g_spec, b_spec in verb_matches:
+                            _mark_turn_out_as_raising(g_spec, gdoc_working)
+                            _mark_turn_out_as_raising(b_spec, bdoc_working)
+
                     g_target_specs = []
                     b_target_specs = []
                     if verb_matches:
@@ -803,8 +1060,9 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                         if is_control_raising:
                             g_verb_variant = None
                             b_verb_variant = None
-                            raising_pool = _filter_pool_with_fallback(_RAISING_VERBS, verb_zipf_thr)
-                            control_pool = _filter_pool_with_fallback(control_verb_pool or _RAISING_VERBS, verb_zipf_thr)
+                            raising_verbs = _raising_verb_list_for_cfg(cfg)
+                            raising_pool = _filter_pool_with_fallback(raising_verbs, verb_zipf_thr)
+                            control_pool = _filter_pool_with_fallback(control_verb_pool or raising_verbs, verb_zipf_thr)
                             same_g_specs, same_b_specs = [], []
                             diff_g_specs, diff_b_specs = [], []
                             for g_spec, b_spec in verb_matches:
@@ -1228,12 +1486,14 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                     if is_control_raising:
                         raising_adj_pool = _filter_pool_with_fallback(_RAISING_ADJECTIVES, adj_zipf_thr)
                         control_adj_pool = _filter_pool_with_fallback(_CONTROL_ADJECTIVES, adj_zipf_thr)
-                        if str(cfg).startswith("tough_vs_raising"):
-                            # In tough-vs-raising subtasks, the grammatical (good)
-                            # sentence is the "tough"/control-like form and the
-                            # ungrammatical (bad) sentence is the raising form.
-                            adj_good_pool = control_adj_pool
+                        tough_adj_pool = _filter_pool_with_fallback(_TOUGH_ADJECTIVES, adj_zipf_thr)
+                        cfg_key = str(cfg).strip().lower()
+                        if cfg_key == "tough_vs_raising_1":
+                            adj_good_pool = tough_adj_pool
                             adj_bad_pool = raising_adj_pool
+                        elif cfg_key == "tough_vs_raising_2":
+                            adj_good_pool = raising_adj_pool
+                            adj_bad_pool = tough_adj_pool
                         else:
                             adj_good_pool = raising_adj_pool
                             adj_bad_pool = control_adj_pool

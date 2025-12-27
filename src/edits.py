@@ -863,6 +863,47 @@ def _normalize_adj_tag(tag: str) -> str:
     return "JJ"
 
 
+def _split_compound_verb_lemma(lemma: str) -> Optional[tuple]:
+    if not lemma:
+        return None
+    if "_" in lemma:
+        parts = [part for part in lemma.split("_") if part]
+    elif " " in lemma:
+        parts = [part for part in lemma.split(" ") if part]
+    else:
+        return None
+    if len(parts) != 2:
+        return None
+    base, tail = parts
+    if not base.isalpha() or not tail.isalpha():
+        return None
+    return base, tail
+
+
+def _inflect_pool_lemma(lemma: str, tag: str) -> Optional[str]:
+    compound = _split_compound_verb_lemma(lemma)
+    if compound:
+        base, tail = compound
+        form = inflect_verb(base, tag)
+        if not form:
+            return None
+        return f"{form} {tail}"
+    return inflect_verb(lemma, tag)
+
+
+def _lemma_has_particle(inventory: Optional[VerbInventory], lemma: str, particle: str) -> bool:
+    if inventory is None or not lemma or not particle:
+        return False
+    entry = inventory.entry_for_lemma(lemma)
+    if entry is None:
+        return False
+    particle_lower = particle.lower()
+    for frame in entry.frames:
+        if frame.kind and frame.kind.endswith("_particle") and frame.particle and frame.particle.lower() == particle_lower:
+            return True
+    return False
+
+
 @dataclass
 class VerbTarget:
     token: Any
@@ -875,6 +916,7 @@ class VerbTarget:
     has_clausal_complement: bool = False
     wh_marker: Optional[str] = None
     enforce_transitivity: bool = False
+    drop_particle: bool = False
 
 
 def _frame_kind_for_verb(token):
@@ -892,6 +934,21 @@ def _frame_kind_for_verb(token):
             and (child.text or "").strip().lower() in _PARTICLE_WORDS
         )
     ]
+    def _prep_as_particle(prep_tok) -> bool:
+        if prep_tok is None:
+            return False
+        if (prep_tok.text or "").strip().lower() not in _PARTICLE_WORDS:
+            return False
+        for child in prep_tok.children:
+            if child.dep_ == "pobj":
+                return False
+        return True
+
+    if preps:
+        particle_preps = [prep for prep in preps if _prep_as_particle(prep)]
+        if particle_preps:
+            particles.extend(particle_preps)
+            preps = [prep for prep in preps if prep not in particle_preps]
     # spaCy sometimes tags clause markers like "that" as dobj; ignore those so
     # we do not inflate ditrans labels.
     objs = [
@@ -1011,6 +1068,7 @@ def candidate_verbs(doc):
             has_that_clause=False,
             has_clausal_complement=False,
             wh_marker=None,
+            drop_particle=False,
         )
 
     def _maybe_participle_attr_noun(tok) -> Optional[VerbTarget]:
@@ -1054,6 +1112,7 @@ def candidate_verbs(doc):
             has_that_clause=False,
             has_clausal_complement=False,
             wh_marker=None,
+            drop_particle=False,
         )
 
     for token in doc:
@@ -1098,6 +1157,7 @@ def candidate_verbs(doc):
                 has_that_clause=_has_that_complement(ccomp),
                 has_clausal_complement=has_ccomp,
                 wh_marker=_wh_marker(ccomp),
+                drop_particle=False,
             )
         )
 
@@ -1595,6 +1655,7 @@ def _normalize_forced_verb_targets(doc, forced_targets) -> List[VerbTarget]:
             that_clause = bool(entry.get("that_clause"))
             forced_wh = entry.get("wh_marker")
             enforce_transitivity = bool(entry.get("enforce_transitivity"))
+            drop_particle = bool(entry.get("drop_particle"))
         elif isinstance(entry, (tuple, list)) and len(entry) >= 3:
             idx, tag, frame = entry[:3]
             prep_idx = entry[3] if len(entry) > 3 else None
@@ -1602,6 +1663,7 @@ def _normalize_forced_verb_targets(doc, forced_targets) -> List[VerbTarget]:
             that_clause = False
             forced_wh = None
             enforce_transitivity = False
+            drop_particle = False
         else:
             continue
         if not isinstance(idx, int) or idx < 0 or idx >= len(doc):
@@ -1641,6 +1703,7 @@ def _normalize_forced_verb_targets(doc, forced_targets) -> List[VerbTarget]:
             has_clausal_complement=bool(has_ccomp or that_clause or inferred_that),
             wh_marker=wh_marker,
             enforce_transitivity=enforce_transitivity,
+            drop_particle=drop_particle,
         ))
         seen.add(idx)
     return targets
@@ -1662,6 +1725,7 @@ def verb_swap_all(
     rng: Optional[random.Random] = None,
     forced_targets=None,
     override_specs=None,
+    allow_particle_swap: bool = True,
 ):
     """
     Swap lexical verbs using the precomputed verb inventory.
@@ -1719,6 +1783,19 @@ def verb_swap_all(
                 options = [forced_lemma]
             else:
                 options = _clause_verb_options(target, zipf_thr=zipf_thr)
+            particle_token = target.particle_token
+            particle_text = (particle_token.text or "").strip().lower() if particle_token is not None else None
+            drop_particle = bool(target.drop_particle)
+            if particle_text and not drop_particle:
+                particle_options = [
+                    lemma
+                    for lemma in options
+                    if _lemma_has_particle(inventory, lemma, particle_text)
+                ]
+                if particle_options:
+                    options = particle_options
+                else:
+                    drop_particle = True
             if zipf_weighted:
                 options = _weighted_order_by_zipf(options, rng, temp=zipf_temp)
             else:
@@ -1738,6 +1815,8 @@ def verb_swap_all(
             if override_list is None and chosen_lemma:
                 chosen_by_key[verb_key] = chosen_lemma
             toks[target.token.i] = _match_casing(target.token.text, chosen_form)
+            if drop_particle and particle_token is not None:
+                toks[particle_token.i] = ""
             swaps.append({
                 "i": target.token.i,
                 "old": target.token.text,
@@ -1784,6 +1863,7 @@ def verb_swap_all(
         if override_list is None or entry is None:
             prep_text = target.prep_token.text if target.prep_token is not None else None
             particle_text = target.particle_token.text if target.particle_token is not None else None
+            desired_particle = None if allow_particle_swap else particle_text
             frame_kind = forced_kind or target.frame_kind
             frame_order = [frame_kind]
             # When we need transitivity exclusivity to preserve an argument-structure
@@ -1828,7 +1908,7 @@ def verb_swap_all(
                     fk,
                     rng,
                     desired_prep=prep_text,
-                    desired_particle=particle_text,
+                    desired_particle=desired_particle,
                     zipf_weighted=zipf_weighted,
                     zipf_temp=zipf_temp,
                     restrict_transitivity=restrict,
@@ -1844,7 +1924,7 @@ def verb_swap_all(
                         fk,
                         rng,
                         desired_prep=None,
-                        desired_particle=particle_text,
+                        desired_particle=desired_particle,
                         zipf_weighted=zipf_weighted,
                         zipf_temp=zipf_temp,
                         restrict_transitivity=restrict,
@@ -1894,12 +1974,15 @@ def verb_swap_all(
 
         particle_old = target.particle_token.text if target.particle_token is not None else None
         particle_new = None
-        if _frame_requires_particle(frame.kind):
+        if target.drop_particle and target.particle_token is not None:
+            toks[target.particle_token.i] = ""
+            particle_new = None
+        elif _frame_requires_particle(frame.kind):
             particle_token = target.particle_token
             if particle_token is None:
                 return None, []
-            if frame.particle and particle_old and frame.particle.lower() != particle_old.lower():
-                replacement = particle_old
+            if allow_particle_swap and frame.particle:
+                replacement = frame.particle
             else:
                 replacement = frame.particle or particle_old
             if not replacement:
@@ -1949,12 +2032,19 @@ def verb_swap_from_pool(
     if not targets:
         return None, []
 
-    pool = [
-        (lemma or "").strip().lower()
-        for lemma in (lemma_pool or [])
-        if isinstance(lemma, str)
-    ]
-    pool = [lemma for lemma in pool if lemma and " " not in lemma and "_" not in lemma]
+    pool = []
+    for lemma in (lemma_pool or []):
+        if not isinstance(lemma, str):
+            continue
+        norm = (lemma or "").strip().lower()
+        if not norm:
+            continue
+        if _split_compound_verb_lemma(norm):
+            pool.append(norm)
+            continue
+        if " " in norm or "_" in norm:
+            continue
+        pool.append(norm)
     if not pool:
         return None, []
 
@@ -1972,7 +2062,7 @@ def verb_swap_from_pool(
         tied = chosen_by_key.get(key)
         chosen = None
         if tied:
-            form = inflect_verb(tied, target.tag)
+            form = _inflect_pool_lemma(tied, target.tag)
             if form:
                 chosen = (tied, form)
 
@@ -1980,7 +2070,7 @@ def verb_swap_from_pool(
             pool_order = list(pool)
             rng.shuffle(pool_order)
             for lemma in pool_order:
-                form = inflect_verb(lemma, target.tag)
+                form = _inflect_pool_lemma(lemma, target.tag)
                 if form:
                     chosen = (lemma, form)
                     break
@@ -1997,7 +2087,10 @@ def verb_swap_from_pool(
 
         particle_old = target.particle_token.text if target.particle_token is not None else None
         particle_new = particle_old
-        if _frame_requires_particle(target.frame_kind):
+        if target.drop_particle and target.particle_token is not None:
+            toks[target.particle_token.i] = ""
+            particle_new = None
+        elif _frame_requires_particle(target.frame_kind):
             toks[target.particle_token.i] = particle_old
 
         swaps.append({
