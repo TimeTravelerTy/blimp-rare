@@ -44,6 +44,15 @@ def _select_dtype(device: torch.device, requested: Optional[str]):
     return torch.float32
 
 
+def _tokenizer_help_error(model_name: str) -> RuntimeError:
+    msg = (
+        f"Failed to load tokenizer for {model_name!r}. "
+        "If this is a SentencePiece/LLama/Mistral tokenizer, install "
+        "`sentencepiece` and `protobuf` in your environment."
+    )
+    return RuntimeError(msg)
+
+
 class LlamaNLLScorer:
     """
     Fast sentence-level NLL scorer for decoder-only models (defaults to Llama 3 8B).
@@ -70,7 +79,18 @@ class LlamaNLLScorer:
         tokenizer_kwargs = {"use_fast": use_fast}
         if trust_remote_code:
             tokenizer_kwargs["trust_remote_code"] = True
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, **tokenizer_kwargs)
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, **tokenizer_kwargs)
+        except Exception as exc:
+            if use_fast:
+                tokenizer_kwargs["use_fast"] = False
+                try:
+                    self.tokenizer = AutoTokenizer.from_pretrained(
+                        tokenizer_source, **tokenizer_kwargs
+                    )
+                except Exception as retry_exc:
+                    raise _tokenizer_help_error(tokenizer_source) from retry_exc
+            raise _tokenizer_help_error(tokenizer_source) from exc
         # Some tokenizers lack an explicit pad token; reuse EOS/UNK or add one.
         added_pad_token = False
         if self.tokenizer.pad_token_id is None:
