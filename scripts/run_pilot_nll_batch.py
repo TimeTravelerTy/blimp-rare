@@ -153,6 +153,15 @@ def main():
     ap.add_argument("--dtype", default="auto", choices=["auto", "bfloat16", "float16", "float32"])
     ap.add_argument("--device-map", default=None)
     ap.add_argument("--compile", action="store_true", help="Try torch.compile for extra throughput on CUDA.")
+    ap.add_argument("--tokenizer", default=None, help="Optional tokenizer name/path (defaults to --model).")
+    ap.add_argument("--use-slow-tokenizer", action="store_true", help="Disable fast tokenizer.")
+    ap.add_argument("--trust-remote-code", action="store_true", help="Allow custom HF modeling/tokenizer code.")
+    ap.add_argument(
+        "--padding-side",
+        default="left",
+        choices=["left", "right"],
+        help="Tokenizer padding side (default: left).",
+    )
     ap.add_argument(
         "--out-dir",
         default="results/sentence_nll_runs",
@@ -172,10 +181,14 @@ def main():
 
     scorer = LlamaNLLScorer(
         model_name=args.model,
+        tokenizer_name=args.tokenizer,
         device=args.device,
         dtype=args.dtype,
         device_map=args.device_map,
         compile_model=args.compile,
+        use_fast=not args.use_slow_tokenizer,
+        trust_remote_code=args.trust_remote_code,
+        padding_side=args.padding_side,
     )
 
     out_dir = Path(args.out_dir)

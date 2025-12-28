@@ -223,6 +223,8 @@ if __name__ == "__main__":
                 verb_mode=args.verb_mode, verb_zipf_thr=args.verb_zipf,
                 rare_verb_lemmas=rare_verbs,
                 verb_zipf_min=args.verb_zipf_min,
+                noun_zipf_min=args.oewn_zipf_min,
+                adj_zipf_min=args.adj_oewn_zipf_min,
                 verb_min_verb_share=args.verb_min_verb_share,
                 verb_inventory=verb_inventory_obj,
                 seed=args.seed,

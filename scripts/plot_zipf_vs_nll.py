@@ -225,7 +225,7 @@ def main() -> None:
     ap.add_argument(
         "--quantile-bins",
         type=int,
-        default=10,
+        default=20,
         help="Number of quantile bins for swapped_median_zipf (uses pd.qcut).",
     )
     args = ap.parse_args()

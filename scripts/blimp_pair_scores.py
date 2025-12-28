@@ -197,6 +197,15 @@ def main() -> None:
     ap.add_argument("--dtype", default="auto", choices=["auto", "float16", "bfloat16", "float32"])
     ap.add_argument("--device-map", default=None, help="Optional HF device_map (e.g., auto).")
     ap.add_argument("--compile-model", action="store_true", help="Use torch.compile when available.")
+    ap.add_argument("--tokenizer", default=None, help="Optional tokenizer name/path (defaults to --model).")
+    ap.add_argument("--use-slow-tokenizer", action="store_true", help="Disable fast tokenizer.")
+    ap.add_argument("--trust-remote-code", action="store_true", help="Allow custom HF modeling/tokenizer code.")
+    ap.add_argument(
+        "--padding-side",
+        default="left",
+        choices=["left", "right"],
+        help="Tokenizer padding side (default: left).",
+    )
     ap.add_argument("--good-field", default=None, help="Field for grammatical sentences.")
     ap.add_argument("--bad-field", default=None, help="Field for ungrammatical sentences.")
     ap.add_argument("--output", default=None, help="Optional JSONL output path.")
@@ -213,10 +222,14 @@ def main() -> None:
 
     scorer = LlamaNLLScorer(
         model_name=args.model,
+        tokenizer_name=args.tokenizer,
         device=args.device,
         dtype=args.dtype,
         device_map=args.device_map,
         compile_model=args.compile_model,
+        use_fast=not args.use_slow_tokenizer,
+        trust_remote_code=args.trust_remote_code,
+        padding_side=args.padding_side,
     )
 
     if args.variant == "both":

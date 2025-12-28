@@ -125,6 +125,7 @@ _PARTICLE_WORDS = {
     "across",
     "ahead",
     "along",
+    "apart",
     "around",
     "aside",
     "away",
@@ -676,6 +677,7 @@ def _prepare_pools(
     rare_person_lemmas,
     req,
     zipf_thr,
+    zipf_min,
     becl_map,
 ):
     rare_tuple_raw = rare_lemmas if isinstance(rare_lemmas, tuple) else tuple(rare_lemmas)
@@ -688,6 +690,7 @@ def _prepare_pools(
         rare_tuple_raw,
         person_tuple_raw,
         zipf_thr,
+        zipf_min,
         id(becl_map) if becl_map is not None else None,
     )
     cached = _POOL_CACHE.get(key)
@@ -745,12 +748,12 @@ def _prepare_pools(
         if person_filtered:
             person_tuple = person_filtered
 
-    if zipf_thr is None:
+    if zipf_thr is None and zipf_min is None:
         pool = list(rare_tuple)
         pool_person = list(person_tuple)
     else:
-        pool = [w for w in rare_tuple if is_rare_lemma(w, zipf_thr)]
-        pool_person = [w for w in person_tuple if is_rare_lemma(w, zipf_thr)]
+        pool = [w for w in rare_tuple if is_rare_lemma(w, zipf_thr, zipf_min)]
+        pool_person = [w for w in person_tuple if is_rare_lemma(w, zipf_thr, zipf_min)]
 
     def _becl_class(lemma: str) -> Optional[str]:
         if not becl_map:
@@ -945,6 +948,16 @@ def _frame_kind_for_verb(token):
         return True
 
     if preps:
+        # Drop clausal adjunct preps (e.g., "before running") so we can still
+        # treat a single PP complement like "drop by" as swappable.
+        clausal_preps = [
+            prep
+            for prep in preps
+            if any(child.dep_ == "pcomp" for child in prep.children)
+        ]
+        if clausal_preps and len(preps) > 1:
+            preps = [prep for prep in preps if prep not in clausal_preps]
+
         particle_preps = [prep for prep in preps if _prep_as_particle(prep)]
         if particle_preps:
             particles.extend(particle_preps)
@@ -1032,6 +1045,30 @@ def candidate_verbs(doc):
             lower = cc_tok.text.lower()
             if lower in {"what", "who"}:
                 return lower
+        return None
+
+    def _lookahead_prep(tok) -> Optional[Any]:
+        doc = tok.doc
+        if doc is None:
+            return None
+        for offset in (1, 2, 3):
+            idx = tok.i + offset
+            if idx >= len(doc):
+                break
+            cand = doc[idx]
+            if cand is None:
+                continue
+            if cand.pos_ == "PUNCT":
+                break
+            if cand.pos_ in {"ADV", "PART"}:
+                continue
+            if (cand.text or "").strip().lower() in {"that", "whether", "if", "what", "who", "which", "whom"}:
+                break
+            if cand.dep_ == "prt" or (cand.text or "").strip().lower() in _PARTICLE_WORDS:
+                break
+            if cand.pos_ == "ADP":
+                return cand
+            break
         return None
 
     def _maybe_participle_amod(tok) -> Optional[VerbTarget]:
@@ -1143,6 +1180,15 @@ def candidate_verbs(doc):
         kind, prep, particle = frame_info
         ccomp = _ccomp_child(token)
         has_ccomp = ccomp is not None
+        if prep is None and has_ccomp:
+            # If we see a nearby PP, suppress clausal handling and treat it as PP-backed.
+            lookahead_prep = _lookahead_prep(token)
+            if lookahead_prep is not None:
+                prep = lookahead_prep
+                has_ccomp = False
+                ccomp = None
+                if not kind.endswith("_pp"):
+                    kind = "intr_pp" if kind.startswith("intr") else "ditrans_pp"
         if prep is not None:
             has_ccomp = False
             ccomp = None
@@ -1176,7 +1222,9 @@ def _load_clause_verb_whitelists() -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _clause_verb_options(target: VerbTarget, *, zipf_thr: Optional[float]) -> List[str]:
+def _clause_verb_options(
+    target: VerbTarget, *, zipf_thr: Optional[float], zipf_min: Optional[float] = None
+) -> List[str]:
     """
     Return a list of candidate lemmas for verbs that embed clausal complements.
     Falls back to the hardcoded list when no whitelist is available.
@@ -1217,7 +1265,7 @@ def _clause_verb_options(target: VerbTarget, *, zipf_thr: Optional[float]) -> Li
     if zipf_thr is None:
         return normalized
 
-    filtered = [lemma for lemma in normalized if is_rare_lemma(lemma, zipf_thr)]
+    filtered = [lemma for lemma in normalized if is_rare_lemma(lemma, zipf_thr, zipf_min)]
     return filtered if filtered else normalized
 
 
@@ -1227,6 +1275,7 @@ def noun_swap_all(
     noun_mode="all",
     k=2,
     zipf_thr=3.4,
+    zipf_min: Optional[float] = None,
     zipf_weighted: bool = False,
     zipf_temp: float = 1.0,
     becl_map=None,
@@ -1359,6 +1408,7 @@ def noun_swap_all(
             person_tuple,
             req,
             zipf_thr,
+            zipf_min,
             becl_map,
         )
 
@@ -1399,19 +1449,22 @@ def noun_swap_all(
 
         # Tie identical original lemmas to the same replacement lemma.
         # Keep animate/gender requirements in the key so reflexive constraints remain safe.
-        def _noun_key(tok, require_person: bool, require_gender: Optional[str]):
-            lemma_key = (tok.lemma_ or tok.text or "").strip().lower()
-            return (lemma_key, bool(require_person), (require_gender or None))
+        def _noun_key(tok):
+            return (tok.lemma_ or tok.text or "").strip().lower()
 
         groups = {}
         for token, tag, require_person, require_gender in targets:
-            key = _noun_key(token, require_person, require_gender)
+            key = _noun_key(token)
             groups.setdefault(key, []).append((token, tag, require_person, require_gender))
 
         chosen_by_key = {}
         for key, group in groups.items():
             require_person = any(req_person for _, _, req_person, _ in group)
-            require_gender = group[0][3]
+            genders = {gender for _, _, _, gender in group if gender}
+            if len(genders) > 1:
+                return None, []
+            require_gender = next(iter(genders)) if genders else None
+            require_person = bool(require_person or require_gender)
             if require_gender and enforce_gender:
                 choice_pool = gender_pools.get(require_gender)
             elif require_person:
@@ -1438,7 +1491,7 @@ def noun_swap_all(
             chosen_by_key[key] = chosen_lemma
 
         for token, tag, require_person, require_gender in targets:
-            key = _noun_key(token, require_person, require_gender)
+            key = _noun_key(token)
             lemma = chosen_by_key.get(key)
             if not lemma:
                 return None, []
@@ -1459,11 +1512,11 @@ def noun_swap_all(
     return text, swaps
 
 
-def _prepare_adj_pool(rare_lemmas, zipf_thr):
+def _prepare_adj_pool(rare_lemmas, zipf_thr, zipf_min=None):
     rare_tuple = rare_lemmas if isinstance(rare_lemmas, tuple) else tuple(rare_lemmas)
-    if zipf_thr is None:
+    if zipf_thr is None and zipf_min is None:
         return rare_tuple
-    return tuple(w for w in rare_tuple if is_rare_lemma(w, zipf_thr))
+    return tuple(w for w in rare_tuple if is_rare_lemma(w, zipf_thr, zipf_min))
 
 
 def adjective_swap_all(
@@ -1472,6 +1525,7 @@ def adjective_swap_all(
     adj_mode="all",
     k=2,
     zipf_thr=3.4,
+    zipf_min: Optional[float] = None,
     zipf_weighted: bool = False,
     zipf_temp: float = 1.0,
     rng: Optional[random.Random]=None,
@@ -1567,7 +1621,7 @@ def adjective_swap_all(
                 "lemma": lemma,
             })
     else:
-        pool = list(_prepare_adj_pool(rare_lemmas, zipf_thr))
+        pool = list(_prepare_adj_pool(rare_lemmas, zipf_thr, zipf_min))
         if not pool:
             return None, swaps
         # Tie identical original lemmas to the same replacement lemma.
@@ -1586,17 +1640,18 @@ def adjective_swap_all(
                 if all(_inflect_adj_surface(token, tag, lemma) for token, tag in group):
                     chosen_lemma = lemma
                     break
-            if chosen_lemma:
-                chosen_by_key[key] = chosen_lemma
+            if not chosen_lemma:
+                return None, []
+            chosen_by_key[key] = chosen_lemma
 
         for token, tag in targets:
             key = (token.lemma_ or token.text or "").strip().lower()
             lemma = chosen_by_key.get(key)
             if not lemma:
-                continue
+                return None, []
             surface = _inflect_adj_surface(token, tag, lemma)
             if not surface:
-                continue
+                return None, []
             toks[token.i] = _match_casing(token.text, surface)
             swaps.append({"i": token.i, "old": token.text, "new": toks[token.i], "tag": tag, "lemma": lemma})
 
@@ -1717,6 +1772,7 @@ def verb_swap_all(
     verb_mode: str = "k",
     k: int = 1,
     zipf_thr: Optional[float] = None,
+    zipf_min: Optional[float] = None,
     zipf_weighted: bool = False,
     zipf_temp: float = 1.0,
     prefer_verb_lemmas: bool = False,
@@ -1765,7 +1821,7 @@ def verb_swap_all(
             return None, []
 
     def _verb_key(t: VerbTarget):
-        return (t.lemma, bool(t.has_clausal_complement), t.frame_kind)
+        return (t.lemma or "").strip().lower()
 
     chosen_by_key = {}
 
@@ -1782,7 +1838,7 @@ def verb_swap_all(
             elif forced_lemma:
                 options = [forced_lemma]
             else:
-                options = _clause_verb_options(target, zipf_thr=zipf_thr)
+                options = _clause_verb_options(target, zipf_thr=zipf_thr, zipf_min=zipf_min)
             particle_token = target.particle_token
             particle_text = (particle_token.text or "").strip().lower() if particle_token is not None else None
             drop_particle = bool(target.drop_particle)
@@ -1883,6 +1939,8 @@ def verb_swap_all(
                     if lookup:
                         sample = lookup
                         break
+                if sample is None:
+                    return None, []
 
             for fk in frame_order:
                 if sample:
@@ -1935,16 +1993,52 @@ def verb_swap_all(
                 if sample:
                     break
             if not sample:
-                # Backwards-compat: if the inventory lacks explicit particle frames,
-                # treat phrasal verbs as ineligible rather than failing the entire swap.
+                # Backwards-compat: if the inventory lacks a matching particle frame,
+                # allow other particles in the same frame family; otherwise skip.
                 if (
                     override_list is None
                     and forced_targets is None
                     and target.frame_kind
                     and target.frame_kind.endswith("_particle")
                 ):
-                    continue
-                return None, []
+                    for fk in frame_order:
+                        restrict = forced_restrict
+                        if restrict is None and target.enforce_transitivity:
+                            if fk.startswith("intr"):
+                                restrict = "intr_only"
+                            elif fk.startswith("trans") or fk.startswith("ditrans"):
+                                restrict = "trans_only"
+                        sample = inventory.sample(
+                            fk,
+                            rng,
+                            desired_prep=prep_text,
+                            desired_particle=None,
+                            zipf_weighted=zipf_weighted,
+                            zipf_temp=zipf_temp,
+                            restrict_transitivity=restrict,
+                            prefer_verb_lemmas=prefer_verb_lemmas,
+                            min_verb_share=min_verb_share,
+                            verbiness_lexicon=verbiness_lexicon,
+                        )
+                        if not sample and prep_text is not None:
+                            sample = inventory.sample(
+                                fk,
+                                rng,
+                                desired_prep=None,
+                                desired_particle=None,
+                                zipf_weighted=zipf_weighted,
+                                zipf_temp=zipf_temp,
+                                restrict_transitivity=restrict,
+                                prefer_verb_lemmas=prefer_verb_lemmas,
+                                min_verb_share=min_verb_share,
+                                verbiness_lexicon=verbiness_lexicon,
+                            )
+                        if sample:
+                            break
+                    if not sample:
+                        continue
+                else:
+                    return None, []
             entry, frame = sample
             if override_list is None and entry and entry.lemma:
                 chosen_by_key[verb_key] = entry.lemma
@@ -2058,13 +2152,15 @@ def verb_swap_from_pool(
         if _frame_requires_particle(target.frame_kind) and target.particle_token is None:
             return None, []
 
-        key = (target.lemma, target.frame_kind)
+        key = (target.lemma or "").strip().lower()
         tied = chosen_by_key.get(key)
         chosen = None
         if tied:
             form = _inflect_pool_lemma(tied, target.tag)
             if form:
                 chosen = (tied, form)
+            else:
+                return None, []
 
         if not chosen:
             pool_order = list(pool)

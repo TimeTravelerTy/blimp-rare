@@ -53,24 +53,45 @@ class LlamaNLLScorer:
     def __init__(
         self,
         model_name: str = "meta-llama/Meta-Llama-3-8B",
+        tokenizer_name: Optional[str] = None,
         device: Optional[str] = None,
         dtype: Optional[str] = "auto",
         device_map: Optional[str] = None,
         compile_model: bool = False,
+        use_fast: bool = True,
+        trust_remote_code: bool = False,
+        padding_side: str = "left",
     ):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
         self.dtype = _select_dtype(self.device, dtype)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-        # Llama tokenizers often lack an explicit pad token; reuse EOS for padding.
+        tokenizer_source = tokenizer_name or model_name
+        tokenizer_kwargs = {"use_fast": use_fast}
+        if trust_remote_code:
+            tokenizer_kwargs["trust_remote_code"] = True
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, **tokenizer_kwargs)
+        # Some tokenizers lack an explicit pad token; reuse EOS/UNK or add one.
+        added_pad_token = False
         if self.tokenizer.pad_token_id is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.tokenizer.padding_side = "left"
-        model_kwargs = {"dtype": self.dtype}
+            if self.tokenizer.eos_token is not None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            elif self.tokenizer.unk_token is not None:
+                self.tokenizer.pad_token = self.tokenizer.unk_token
+            else:
+                self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+                added_pad_token = True
+        self.tokenizer.padding_side = padding_side
+        model_kwargs = {"torch_dtype": self.dtype}
+        if trust_remote_code:
+            model_kwargs["trust_remote_code"] = True
         if device_map:
             model_kwargs["device_map"] = device_map
         self.model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+        if added_pad_token:
+            self.model.resize_token_embeddings(len(self.tokenizer))
+        if self.model.config.pad_token_id is None:
+            self.model.config.pad_token_id = self.tokenizer.pad_token_id
         if device_map is None:
             self.model.to(self.device)
         self.model.eval()
