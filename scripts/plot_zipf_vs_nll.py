@@ -31,6 +31,17 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+plt.rcParams.update(
+    {
+        "font.size": 12,
+        "axes.titlesize": 13,
+        "axes.labelsize": 12,
+        "legend.fontsize": 11,
+        "xtick.labelsize": 11,
+        "ytick.labelsize": 11,
+    }
+)
+
 
 PAIR_SCORES_DIR = Path("results/blimp_pair_scores")
 DATA_DIR = Path("data/processed")
@@ -170,7 +181,7 @@ def _per_model_binned(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     return out
 
 
-def _collect_rows(paths: List[Path]) -> pd.DataFrame:
+def _collect_rows(paths: List[Path], char_normalize: bool = False) -> pd.DataFrame:
     dataset_cache: Dict[str, Dict[str, dict]] = {}
     rows: List[dict] = []
 
@@ -185,8 +196,19 @@ def _collect_rows(paths: List[Path]) -> pd.DataFrame:
                 zipf_med = _swapped_median_zipf(meta, rec.get("good_field"), rec.get("bad_field"))
                 if zipf_med is None:
                     continue
-                delta_nll = rec["bad_total_nll"] - rec["good_total_nll"]
-                total_nll = 0.5 * (rec["bad_total_nll"] + rec["good_total_nll"])
+                good_nll = rec.get("good_total_nll")
+                bad_nll = rec.get("bad_total_nll")
+                if not isinstance(good_nll, (int, float)) or not isinstance(bad_nll, (int, float)):
+                    continue
+                if char_normalize:
+                    good_len = _char_len(rec.get("good_text"))
+                    bad_len = _char_len(rec.get("bad_text"))
+                    if not good_len or not bad_len:
+                        continue
+                    good_nll = good_nll / good_len
+                    bad_nll = bad_nll / bad_len
+                delta_nll = bad_nll - good_nll
+                total_nll = 0.5 * (bad_nll + good_nll)
                 rows.append(
                     {
                         "model": model,
@@ -201,10 +223,33 @@ def _collect_rows(paths: List[Path]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _char_len(text: Optional[str]) -> Optional[int]:
+    if not isinstance(text, str):
+        return None
+    return len(text)
+
+
+def _token_len(value: Optional[object]) -> Optional[int]:
+    if isinstance(value, int):
+        return value
+    return None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Plot delta/total NLL vs realised Zipf rarity using BLiMP pair scores.")
     ap.add_argument("--pattern", default="results/blimp_pair_scores/*.jsonl", help="Glob for pair-score JSONL files.")
     ap.add_argument("--out", default=str(PLOT_PATH), help="Output PNG path.")
+    ap.add_argument("--out-pdf", default=None, help="Optional PDF output path.")
+    ap.add_argument(
+        "--char-normalize",
+        action="store_true",
+        help="Normalize NLL by character length (uses len(good_text)/len(bad_text)).",
+    )
+    ap.add_argument(
+        "--token-normalize",
+        action="store_true",
+        help="Normalize NLL by token count (uses good_token_count/bad_token_count).",
+    )
     ap.add_argument("--variant", choices=["rare", "original", "any"], default="any", help="Filter on dataset variant inferred from filename.")
     ap.add_argument(
         "--dataset-contains",
@@ -254,7 +299,50 @@ def main() -> None:
             f"No pair-score files match filters (pattern={args.pattern}, variant={args.variant}, dataset_contains={args.dataset_contains}, window_only={args.window_only})"
         )
 
-    df = _collect_rows(paths)
+    if args.char_normalize and args.token_normalize:
+        raise SystemExit("Choose only one: --char-normalize or --token-normalize.")
+    df = _collect_rows(paths, char_normalize=args.char_normalize)
+    if args.token_normalize:
+        df = _collect_rows(paths, char_normalize=False)
+        df = df.assign(
+            _token_normalize=True,
+        )
+        # Recompute using token counts.
+        rows = []
+        dataset_cache: Dict[str, Dict[str, dict]] = {}
+        for path in paths:
+            model, dataset_base, _ = _parse_pair_scores_path(path)
+            meta_by_idx = _load_dataset_meta(dataset_base, dataset_cache)
+            with path.open() as f:
+                for line in f:
+                    rec = json.loads(line)
+                    meta = meta_by_idx.get(rec.get("idx")) or {}
+                    zipf_med = _swapped_median_zipf(meta, rec.get("good_field"), rec.get("bad_field"))
+                    if zipf_med is None:
+                        continue
+                    good_len = _token_len(rec.get("good_token_count"))
+                    bad_len = _token_len(rec.get("bad_token_count"))
+                    if not good_len or not bad_len:
+                        continue
+                    good_nll = rec.get("good_total_nll")
+                    bad_nll = rec.get("bad_total_nll")
+                    if not isinstance(good_nll, (int, float)) or not isinstance(bad_nll, (int, float)):
+                        continue
+                    good_nll = good_nll / good_len
+                    bad_nll = bad_nll / bad_len
+                    delta_nll = bad_nll - good_nll
+                    total_nll = 0.5 * (bad_nll + good_nll)
+                    rows.append(
+                        {
+                            "model": model,
+                            "swapped_median_zipf": float(zipf_med),
+                            "delta_nll": float(delta_nll),
+                            "total_nll": float(total_nll),
+                        }
+                    )
+        if not rows:
+            raise SystemExit("No data collected after token normalization.")
+        df = pd.DataFrame(rows)
     try:
         df = df.assign(zipf_bin=pd.qcut(df["swapped_median_zipf"], q=args.quantile_bins, duplicates="drop"))
     except ValueError:
@@ -279,20 +367,23 @@ def main() -> None:
     for model, stats in per_model.items():
         if stats.empty:
             continue
-        ax_delta.plot(stats["mid"], stats["delta_mean"], marker="o", label=model)
+        ax_delta.plot(stats["mid"], stats["delta_mean"], marker="o", label=model.replace("_", "."))
         ax_delta.fill_between(stats["mid"], stats["delta_lo"], stats["delta_hi"], alpha=0.2)
 
-        ax_total.plot(stats["mid"], stats["total_mean"], marker="o", label=model)
+        ax_total.plot(stats["mid"], stats["total_mean"], marker="o", label=model.replace("_", "."))
         ax_total.fill_between(stats["mid"], stats["total_lo"], stats["total_hi"], alpha=0.2)
 
-    ax_delta.set_title("Delta NLL vs realised median Zipf (rarity increases →)")
-    ax_delta.set_ylabel("Δ NLL (bad - good)")
+    norm_suffix = ""
+    if args.char_normalize:
+        norm_suffix = " / char"
+    if args.token_normalize:
+        norm_suffix = " / token"
+    ax_delta.set_ylabel(f"Δ NLL (bad - good){norm_suffix}")
     ax_delta.legend()
     ax_delta.grid(True, alpha=0.3)
 
-    ax_total.set_title("Total NLL vs realised median Zipf")
-    ax_total.set_ylabel("Total NLL (mean of pair)")
-    ax_total.set_xlabel("Realised median Zipf of swapped lemmas")
+    ax_total.set_ylabel(f"Total NLL (mean of pair){norm_suffix}")
+    ax_total.set_xlabel("Realised median Zipf")
     ax_total.grid(True, alpha=0.3)
 
     # Higher Zipf = more common, so flip the x-axis to show rarity increasing left→right.
@@ -306,6 +397,8 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(out_path, dpi=200)
+    if args.out_pdf:
+        fig.savefig(Path(args.out_pdf))
 
     corr_text = "\n".join(correlations) + "\n"
     CORR_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -314,6 +407,8 @@ def main() -> None:
     for line in correlations:
         print(line)
     print(f"Saved plot to {out_path}")
+    if args.out_pdf:
+        print(f"Saved PDF to {args.out_pdf}")
     print(f"Saved correlations to {CORR_PATH}")
 
 
