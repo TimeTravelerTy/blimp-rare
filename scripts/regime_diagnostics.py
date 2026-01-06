@@ -225,7 +225,7 @@ def main() -> None:
     max_share = max(shares) if shares else 0.0
     ax_bar.set_ylim(0, min(1.0, max_share * 1.25 if max_share > 0 else 0.25))
     # ax_bar.set_title("Top-20 lemma share by regime")
-    ax_bar.set_ylabel("Share of swaps")
+    ax_bar.set_ylabel("Top-20 lemma share")
     ax_bar.grid(True, axis="y", alpha=0.3)
 
     out_path = Path(args.out)

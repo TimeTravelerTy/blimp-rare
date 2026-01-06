@@ -10,6 +10,8 @@ from src.lemma_bank import (
 )
 from src.verb_inventory import VerbInventory, load_verb_inventory
 
+DEFAULT_SWAP_TOKENIZER = "meta-llama/Llama-3.1-8B"
+
 def _fmt_zipf(val) -> str:
     if val is None:
         return "none"
@@ -146,6 +148,17 @@ if __name__ == "__main__":
         default=None,
         help="Limit the number of output items (pairs) written to the dataset.",
     )
+    ap.add_argument(
+        "--match-token-count",
+        action="store_true",
+        default=False,
+        help="Require swapped wordforms to match the tokenizer token count of the original.",
+    )
+    ap.add_argument(
+        "--swap-tokenizer",
+        default=DEFAULT_SWAP_TOKENIZER,
+        help=f"Tokenizer name/path for token count matching (default: {DEFAULT_SWAP_TOKENIZER}).",
+    )
     args = ap.parse_args()
 
     _apply_zipf_overrides(args)
@@ -235,4 +248,6 @@ if __name__ == "__main__":
                 zipf_weighted_sampling=args.zipf_weighted_sampling,
                 zipf_temp=args.zipf_temp,
                 spacy_n_process=args.spacy_n_process,
-                spacy_batch_size=args.spacy_batch_size)
+                spacy_batch_size=args.spacy_batch_size,
+                match_token_count=args.match_token_count,
+                swap_tokenizer=args.swap_tokenizer)

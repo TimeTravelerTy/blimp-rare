@@ -178,6 +178,7 @@ def _write_variant(
                 "group": rec.get("group"),
                 "phenomenon": rec.get("phenomenon"),
                 "subtask": rec.get("subtask"),
+                "field": rec.get("field"),
                 "variant": variant,
                 "good_field": picked_good,
                 "bad_field": picked_bad,

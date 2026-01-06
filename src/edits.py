@@ -29,6 +29,8 @@ _ARTICLE_DETERMINERS = {"a", "an", "the", "some"}
 _ADJ_EXCLUDE = {"many", "most", "much", "few", "several"}
 _POOL_CACHE = {}
 _WEIGHT_CACHE = {}
+_DEFAULT_SWAP_TOKENIZER = "meta-llama/Llama-3.1-8B"
+_TOKENIZER_CACHE = {}
 
 _ABSTRACT_SUFFIXES = ("ness", "hood", "ship", "ism", "ity", "ment", "ance", "ence", "ency", "age", "is", "ia", "ry")
 _TAXON_SUFFIXES = ("idae", "ideae", "aceae", "ales")
@@ -331,6 +333,36 @@ def _zipf_freq_cached(lemma: str) -> float:
         return 0.0
 
 
+def _get_tokenizer(tokenizer_name: Optional[str] = None):
+    name = tokenizer_name or _DEFAULT_SWAP_TOKENIZER
+    cached = _TOKENIZER_CACHE.get(name)
+    if cached is not None:
+        return cached
+    try:
+        from transformers import AutoTokenizer
+    except Exception as exc:
+        raise RuntimeError("Token count matching requires transformers.") from exc
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(name, use_fast=True)
+    except Exception:
+        tokenizer = AutoTokenizer.from_pretrained(name, use_fast=False)
+    _TOKENIZER_CACHE[name] = tokenizer
+    return tokenizer
+
+
+def _token_count(tokenizer, text: str) -> int:
+    if text is None:
+        return 0
+    if not isinstance(text, str):
+        text = str(text)
+    text = text.strip()
+    if not text:
+        return 0
+    if not text.startswith(" "):
+        text = " " + text
+    return len(tokenizer.encode(text, add_special_tokens=False))
+
+
 def _zipf_weights(pool: List[str], temp: float = 1.0) -> List[float]:
     if not pool:
         return []
@@ -566,6 +598,24 @@ def _apply_noun_form(token, form: str, toks) -> str:
     except Exception:
         pass
     return token.text
+
+
+def _noun_original_surface(token) -> str:
+    if _is_ex_compound(token):
+        try:
+            doc = token.doc
+            prev_dash = doc[token.i - 1]
+            prev_ex = doc[token.i - 2]
+            return f"{prev_ex.text}{prev_dash.text}{token.text}"
+        except Exception:
+            return token.text
+    return token.text
+
+
+def _noun_candidate_surface(token, form: str) -> str:
+    if _is_ex_compound(token):
+        return f"ex-{form}"
+    return form
 
 
 def _plural_form_ok(plural: str, lemma: str, singular_forms: tuple[str, ...]) -> bool:
@@ -1286,6 +1336,9 @@ def noun_swap_all(
     rare_gender_lemmas=None,
     override_lemmas=None,
     reflexive_subjects=None,
+    match_token_count: bool = False,
+    tokenizer_name: Optional[str] = None,
+    tokenizer=None,
 ):
     """
     rare_lemmas: iterable[str] of candidate noun lemmas. If ``zipf_thr`` is None
@@ -1304,6 +1357,8 @@ def noun_swap_all(
     override_lemmas: optional iterable of lemma strings to use (in target order)
         instead of sampling from the rare pools. When provided, the function
         ignores ``rare_lemmas`` and ``rng`` for selection.
+    match_token_count: when True, require replacement surfaces to match the
+        tokenizer token count of the original surface.
     """
     if rng is None:
         rng = random
@@ -1366,29 +1421,40 @@ def noun_swap_all(
             targets.append((t, t.tag_, require_person, require_gender))
 
     if not targets:
-        return None, swaps
+        return None, swaps, None
+
+    tokenizer_obj = None
+    token_counts = {}
+    if match_token_count:
+        tokenizer_obj = tokenizer if tokenizer is not None else _get_tokenizer(tokenizer_name)
+        for token, _, _, _ in targets:
+            token_counts[token.i] = _token_count(tokenizer_obj, _noun_original_surface(token))
 
     override_list = None
     if override_lemmas is not None:
         override_list = list(override_lemmas)
 
     if override_list is None and not rare_lemmas:
-        return None, swaps
+        return None, swaps, None
 
     if noun_mode == "k":
         targets = targets[:max(0, min(k, len(targets)))]
 
     if override_list is not None:
         if len(override_list) != len(targets):
-            return None, []
+            return None, [], None
         if not override_list:
-            return None, []
+            return None, [], None
         for (token, tag, _, _), lemma in zip(targets, override_list):
             if not lemma or not isinstance(lemma, str):
-                return None, []
+                return None, [], None
             form = inflect_noun(lemma, tag)
             if not form:
-                return None, []
+                return None, [], None
+            if match_token_count:
+                candidate_surface = _noun_candidate_surface(token, form)
+                if _token_count(tokenizer_obj, candidate_surface) != token_counts.get(token.i, 0):
+                    return None, [], "noun_no_token_match"
             old_surface = _apply_noun_form(token, form, toks)
             swaps.append({
                 "i": token.i,
@@ -1416,7 +1482,7 @@ def noun_swap_all(
         pool_person = list(pool_person)
 
         if not pool and not pool_person:
-            return None, swaps
+            return None, swaps, None
 
         pool_set = set(pool)
         person_set = set(pool_person)
@@ -1439,13 +1505,13 @@ def noun_swap_all(
         required_genders = {gender for _, _, _, gender in targets if gender}
 
         if needs_person and not pool_person_checked:
-            return None, []
+            return None, [], None
         if needs_non_person and not pool_non_person_checked:
-            return None, []
+            return None, [], None
         if enforce_gender:
             for gender in required_genders:
                 if gender and not gender_pools.get(gender):
-                    return None, []
+                    return None, [], None
 
         # Tie identical original lemmas to the same replacement lemma.
         # Keep animate/gender requirements in the key so reflexive constraints remain safe.
@@ -1462,7 +1528,7 @@ def noun_swap_all(
             require_person = any(req_person for _, _, req_person, _ in group)
             genders = {gender for _, _, _, gender in group if gender}
             if len(genders) > 1:
-                return None, []
+                return None, [], None
             require_gender = next(iter(genders)) if genders else None
             require_person = bool(require_person or require_gender)
             if require_gender and enforce_gender:
@@ -1472,7 +1538,7 @@ def noun_swap_all(
             else:
                 choice_pool = pool_non_person_checked
             if not choice_pool:
-                return None, []
+                return None, [], None
             needed_tags = {tag for _, tag, _, _ in group}
             pool_order = (
                 _weighted_order_by_zipf(choice_pool, rng, temp=zipf_temp)
@@ -1482,34 +1548,49 @@ def noun_swap_all(
             if not zipf_weighted:
                 rng.shuffle(pool_order)
             chosen_lemma = None
+            saw_token_mismatch = False
             for lemma in pool_order:
-                if all(inflect_noun(lemma, tag) for tag in needed_tags):
+                ok = True
+                for token, tag, _, _ in group:
+                    form = inflect_noun(lemma, tag)
+                    if not form:
+                        ok = False
+                        break
+                    if match_token_count:
+                        candidate_surface = _noun_candidate_surface(token, form)
+                        if _token_count(tokenizer_obj, candidate_surface) != token_counts.get(token.i, 0):
+                            saw_token_mismatch = True
+                            ok = False
+                            break
+                if ok:
                     chosen_lemma = lemma
                     break
             if not chosen_lemma:
-                return None, []
+                if match_token_count and saw_token_mismatch:
+                    return None, [], "noun_no_token_match"
+                return None, [], None
             chosen_by_key[key] = chosen_lemma
 
         for token, tag, require_person, require_gender in targets:
             key = _noun_key(token)
             lemma = chosen_by_key.get(key)
             if not lemma:
-                return None, []
+                return None, [], None
             form = inflect_noun(lemma, tag)
             if not form:
-                return None, []
+                return None, [], None
             old_surface = _apply_noun_form(token, form, toks)
             swaps.append({"i": token.i, "old": old_surface, "new": form, "tag": tag, "lemma": lemma})
 
     if not swaps:
-        return None, swaps
+        return None, swaps, None
 
     _adjust_indefinite_articles(toks)
     text = _detokenize(toks)
     # Capitalize the first character of the sentence
     if text:
         text = text[0].upper() + text[1:]
-    return text, swaps
+    return text, swaps, None
 
 
 def _prepare_adj_pool(rare_lemmas, zipf_thr, zipf_min=None):
@@ -1531,6 +1612,9 @@ def adjective_swap_all(
     rng: Optional[random.Random]=None,
     forced_targets=None,
     override_lemmas=None,
+    match_token_count: bool = False,
+    tokenizer_name: Optional[str] = None,
+    tokenizer=None,
 ):
     """
     Swap attributive adjectives with rare lemmas.
@@ -1569,14 +1653,21 @@ def adjective_swap_all(
         targets = [(t, _normalize_adj_tag(t.tag_)) for t in detected]
 
     if not targets:
-        return None, swaps
+        return None, swaps, None
+
+    tokenizer_obj = None
+    token_counts = {}
+    if match_token_count:
+        tokenizer_obj = tokenizer if tokenizer is not None else _get_tokenizer(tokenizer_name)
+        for token, _ in targets:
+            token_counts[token.i] = _token_count(tokenizer_obj, token.text)
 
     override_list = None
     if override_lemmas is not None:
         override_list = list(override_lemmas)
 
     if override_list is None and not rare_lemmas:
-        return None, swaps
+        return None, swaps, None
 
     if adj_mode == "k":
         targets = targets[:max(0, min(k, len(targets)))]
@@ -1603,15 +1694,18 @@ def adjective_swap_all(
 
     if override_list is not None:
         if len(override_list) != len(targets):
-            return None, []
+            return None, [], None
         if not override_list:
-            return None, []
+            return None, [], None
         for (token, tag), lemma in zip(targets, override_list):
             if not lemma or not isinstance(lemma, str):
-                return None, []
+                return None, [], None
             surface = _inflect_adj_surface(token, tag, lemma)
             if not surface:
-                return None, []
+                return None, [], None
+            if match_token_count:
+                if _token_count(tokenizer_obj, surface) != token_counts.get(token.i, 0):
+                    return None, [], "adj_no_token_match"
             toks[token.i] = _match_casing(token.text, surface)
             swaps.append({
                 "i": token.i,
@@ -1623,7 +1717,7 @@ def adjective_swap_all(
     else:
         pool = list(_prepare_adj_pool(rare_lemmas, zipf_thr, zipf_min))
         if not pool:
-            return None, swaps
+            return None, swaps, None
         # Tie identical original lemmas to the same replacement lemma.
         groups = {}
         for token, tag in targets:
@@ -1636,33 +1730,47 @@ def adjective_swap_all(
             if not zipf_weighted:
                 rng.shuffle(pool_order)
             chosen_lemma = None
+            saw_token_mismatch = False
             for lemma in pool_order:
-                if all(_inflect_adj_surface(token, tag, lemma) for token, tag in group):
+                ok = True
+                for token, tag in group:
+                    surface = _inflect_adj_surface(token, tag, lemma)
+                    if not surface:
+                        ok = False
+                        break
+                    if match_token_count:
+                        if _token_count(tokenizer_obj, surface) != token_counts.get(token.i, 0):
+                            saw_token_mismatch = True
+                            ok = False
+                            break
+                if ok:
                     chosen_lemma = lemma
                     break
             if not chosen_lemma:
-                return None, []
+                if match_token_count and saw_token_mismatch:
+                    return None, [], "adj_no_token_match"
+                return None, [], None
             chosen_by_key[key] = chosen_lemma
 
         for token, tag in targets:
             key = (token.lemma_ or token.text or "").strip().lower()
             lemma = chosen_by_key.get(key)
             if not lemma:
-                return None, []
+                return None, [], None
             surface = _inflect_adj_surface(token, tag, lemma)
             if not surface:
-                return None, []
+                return None, [], None
             toks[token.i] = _match_casing(token.text, surface)
             swaps.append({"i": token.i, "old": token.text, "new": toks[token.i], "tag": tag, "lemma": lemma})
 
     if not swaps:
-        return None, swaps
+        return None, swaps, None
 
     _adjust_indefinite_articles(toks)
     text = _detokenize(toks)
     if text:
         text = text[0].upper() + text[1:]
-    return text, swaps
+    return text, swaps, None
 
 
 def _frame_requires_prep(kind: str) -> bool:
@@ -1782,6 +1890,9 @@ def verb_swap_all(
     forced_targets=None,
     override_specs=None,
     allow_particle_swap: bool = True,
+    match_token_count: bool = False,
+    tokenizer_name: Optional[str] = None,
+    tokenizer=None,
 ):
     """
     Swap lexical verbs using the precomputed verb inventory.
@@ -1794,7 +1905,7 @@ def verb_swap_all(
         rng = random
 
     if inventory is None or inventory.is_empty():
-        return None, []
+        return None, [], None
 
     transitivity_inv = transitivity_inventory if transitivity_inventory is not None else inventory
 
@@ -1812,18 +1923,44 @@ def verb_swap_all(
         targets = detected
 
     if not targets:
-        return None, swaps
+        return None, swaps, None
+
+    tokenizer_obj = None
+    token_counts = {}
+    if match_token_count:
+        tokenizer_obj = tokenizer if tokenizer is not None else _get_tokenizer(tokenizer_name)
+        for target in targets:
+            token_counts[target.token.i] = _token_count(tokenizer_obj, target.token.text)
 
     override_list = None
     if override_specs is not None:
         override_list = list(override_specs)
         if len(override_list) != len(targets):
-            return None, []
+            return None, [], None
 
     def _verb_key(t: VerbTarget):
         return (t.lemma or "").strip().lower()
 
     chosen_by_key = {}
+
+    def _ordered_choices(choices):
+        choices_list = list(choices)
+        if not choices_list:
+            return []
+        if not zipf_weighted:
+            rng.shuffle(choices_list)
+            return choices_list
+        weights = []
+        for entry, _frame in choices_list:
+            freq = 10 ** _zipf_freq_cached(entry.lemma)
+            adj = freq ** (1.0 / zipf_temp) if zipf_temp and zipf_temp > 0 else freq
+            weights.append(adj if adj > 0 else 0.001)
+        ordered = []
+        while choices_list:
+            idx = rng.choices(range(len(choices_list)), weights=weights, k=1)[0]
+            ordered.append(choices_list.pop(idx))
+            weights.pop(idx)
+        return ordered
 
     for idx, target in enumerate(targets):
         verb_key = _verb_key(target)
@@ -1858,16 +1995,24 @@ def verb_swap_all(
                 rng.shuffle(options)
             chosen_lemma = None
             chosen_form = None
+            saw_token_mismatch = False
             for lemma in options:
                 if not lemma:
                     continue
                 form = inflect_verb(lemma, target.tag)
-                if form:
-                    chosen_lemma = lemma
-                    chosen_form = form
-                    break
+                if not form:
+                    continue
+                if match_token_count:
+                    if _token_count(tokenizer_obj, form) != token_counts.get(target.token.i, 0):
+                        saw_token_mismatch = True
+                        continue
+                chosen_lemma = lemma
+                chosen_form = form
+                break
             if not chosen_form:
-                return None, []
+                if match_token_count and saw_token_mismatch:
+                    return None, [], "verb_no_token_match"
+                return None, [], None
             if override_list is None and chosen_lemma:
                 chosen_by_key[verb_key] = chosen_lemma
             toks[target.token.i] = _match_casing(target.token.text, chosen_form)
@@ -1893,7 +2038,7 @@ def verb_swap_all(
                 frame_name = spec.get("frame")
                 lookup = inventory.lookup(lemma, frame_name or target.frame_kind)
                 if not lookup:
-                    return None, []
+                    return None, [], None
                 entry, frame = lookup
             else:
                 spec = None
@@ -1933,6 +2078,45 @@ def verb_swap_all(
             if isinstance(observed, tuple) and observed:
                 observed_kind = observed[0]
 
+            def _select_matching_sample(kind, desired_prep, desired_particle, restrict):
+                if not match_token_count:
+                    return (
+                        inventory.sample(
+                            kind,
+                            rng,
+                            desired_prep=desired_prep,
+                            desired_particle=desired_particle,
+                            zipf_weighted=zipf_weighted,
+                            zipf_temp=zipf_temp,
+                            restrict_transitivity=restrict,
+                            prefer_verb_lemmas=prefer_verb_lemmas,
+                            min_verb_share=min_verb_share,
+                            verbiness_lexicon=verbiness_lexicon,
+                        ),
+                        False,
+                    )
+                choices = inventory._filtered_choices(
+                    kind,
+                    desired_prep=desired_prep,
+                    desired_particle=desired_particle,
+                    restrict_transitivity=restrict,
+                    prefer_verb_lemmas=prefer_verb_lemmas,
+                    min_verb_share=min_verb_share,
+                    verbiness_lexicon=verbiness_lexicon,
+                )
+                if not choices:
+                    return None, False
+                saw_token_mismatch = False
+                for entry, frame in _ordered_choices(choices):
+                    form = inflect_verb(entry.lemma, target.tag)
+                    if not form:
+                        continue
+                    if _token_count(tokenizer_obj, form) != token_counts.get(target.token.i, 0):
+                        saw_token_mismatch = True
+                        continue
+                    return (entry, frame), saw_token_mismatch
+                return None, saw_token_mismatch
+
             if tied_lemma:
                 for fk in frame_order:
                     lookup = inventory.lookup(tied_lemma, fk)
@@ -1940,7 +2124,15 @@ def verb_swap_all(
                         sample = lookup
                         break
                 if sample is None:
-                    return None, []
+                    return None, [], None
+                if match_token_count:
+                    tied_form = inflect_verb(sample[0].lemma, target.tag)
+                    if not tied_form:
+                        return None, [], None
+                    if _token_count(tokenizer_obj, tied_form) != token_counts.get(target.token.i, 0):
+                        return None, [], "verb_no_token_match"
+
+            token_mismatch_seen = False
 
             for fk in frame_order:
                 if sample:
@@ -1962,34 +2154,24 @@ def verb_swap_all(
                         elif fk.startswith("trans") or fk.startswith("ditrans"):
                             if observed_kind and observed_kind.startswith("intr"):
                                 restrict = "trans_only"
-                sample = inventory.sample(
+                sample, saw_mismatch = _select_matching_sample(
                     fk,
-                    rng,
                     desired_prep=prep_text,
                     desired_particle=desired_particle,
-                    zipf_weighted=zipf_weighted,
-                    zipf_temp=zipf_temp,
-                    restrict_transitivity=restrict,
-                    prefer_verb_lemmas=prefer_verb_lemmas,
-                    min_verb_share=min_verb_share,
-                    verbiness_lexicon=verbiness_lexicon,
+                    restrict=restrict,
                 )
+                token_mismatch_seen = token_mismatch_seen or saw_mismatch
                 if not sample and prep_text is not None:
                     # If the inventory lacks an exact preposition match, fall back to
                     # a frame match without constraining the preposition. The swapper
                     # keeps the original preposition text when it differs anyway.
-                    sample = inventory.sample(
+                    sample, saw_mismatch = _select_matching_sample(
                         fk,
-                        rng,
                         desired_prep=None,
                         desired_particle=desired_particle,
-                        zipf_weighted=zipf_weighted,
-                        zipf_temp=zipf_temp,
-                        restrict_transitivity=restrict,
-                        prefer_verb_lemmas=prefer_verb_lemmas,
-                        min_verb_share=min_verb_share,
-                        verbiness_lexicon=verbiness_lexicon,
+                        restrict=restrict,
                     )
+                    token_mismatch_seen = token_mismatch_seen or saw_mismatch
                 if sample:
                     break
             if not sample:
@@ -2008,44 +2190,41 @@ def verb_swap_all(
                                 restrict = "intr_only"
                             elif fk.startswith("trans") or fk.startswith("ditrans"):
                                 restrict = "trans_only"
-                        sample = inventory.sample(
+                        sample, saw_mismatch = _select_matching_sample(
                             fk,
-                            rng,
                             desired_prep=prep_text,
                             desired_particle=None,
-                            zipf_weighted=zipf_weighted,
-                            zipf_temp=zipf_temp,
-                            restrict_transitivity=restrict,
-                            prefer_verb_lemmas=prefer_verb_lemmas,
-                            min_verb_share=min_verb_share,
-                            verbiness_lexicon=verbiness_lexicon,
+                            restrict=restrict,
                         )
+                        token_mismatch_seen = token_mismatch_seen or saw_mismatch
                         if not sample and prep_text is not None:
-                            sample = inventory.sample(
+                            sample, saw_mismatch = _select_matching_sample(
                                 fk,
-                                rng,
                                 desired_prep=None,
                                 desired_particle=None,
-                                zipf_weighted=zipf_weighted,
-                                zipf_temp=zipf_temp,
-                                restrict_transitivity=restrict,
-                                prefer_verb_lemmas=prefer_verb_lemmas,
-                                min_verb_share=min_verb_share,
-                                verbiness_lexicon=verbiness_lexicon,
+                                restrict=restrict,
                             )
+                            token_mismatch_seen = token_mismatch_seen or saw_mismatch
                         if sample:
                             break
                     if not sample:
+                        if match_token_count and token_mismatch_seen:
+                            return None, [], "verb_no_token_match"
                         continue
                 else:
-                    return None, []
+                    if match_token_count and token_mismatch_seen:
+                        return None, [], "verb_no_token_match"
+                    return None, [], None
             entry, frame = sample
             if override_list is None and entry and entry.lemma:
                 chosen_by_key[verb_key] = entry.lemma
 
         form = inflect_verb(entry.lemma, target.tag)
         if not form:
-            return None, []
+            return None, [], None
+        if match_token_count:
+            if _token_count(tokenizer_obj, form) != token_counts.get(target.token.i, 0):
+                return None, [], "verb_no_token_match"
         toks[target.token.i] = _match_casing(target.token.text, form)
 
         prep_old = target.prep_token.text if target.prep_token is not None else None
@@ -2053,7 +2232,7 @@ def verb_swap_all(
         if _frame_requires_prep(frame.kind):
             prep_token = target.prep_token
             if prep_token is None:
-                return None, []
+                return None, [], None
             # If the sampled frame suggests a different preposition from the
             # original, prefer keeping the original to avoid ungrammatical
             # mixes like "collude to".
@@ -2062,7 +2241,7 @@ def verb_swap_all(
             else:
                 replacement = frame.prep or prep_old
             if not replacement:
-                return None, []
+                return None, [], None
             toks[prep_token.i] = replacement
             prep_new = replacement
 
@@ -2074,13 +2253,13 @@ def verb_swap_all(
         elif _frame_requires_particle(frame.kind):
             particle_token = target.particle_token
             if particle_token is None:
-                return None, []
+                return None, [], None
             if allow_particle_swap and frame.particle:
                 replacement = frame.particle
             else:
                 replacement = frame.particle or particle_old
             if not replacement:
-                return None, []
+                return None, [], None
             toks[particle_token.i] = replacement
             particle_new = replacement
 
@@ -2100,12 +2279,12 @@ def verb_swap_all(
         })
 
     if not swaps:
-        return None, swaps
+        return None, swaps, None
 
     text = _detokenize(toks)
     if text:
         text = text[0].upper() + text[1:]
-    return text, swaps
+    return text, swaps, None
 
 
 def verb_swap_from_pool(
@@ -2114,6 +2293,9 @@ def verb_swap_from_pool(
     *,
     forced_targets=None,
     rng: Optional[random.Random] = None,
+    match_token_count: bool = False,
+    tokenizer_name: Optional[str] = None,
+    tokenizer=None,
 ):
     """
     Swap verbs using a provided lemma pool, preserving the detected frames and
@@ -2124,7 +2306,14 @@ def verb_swap_from_pool(
 
     targets = _normalize_forced_verb_targets(doc, forced_targets or [])
     if not targets:
-        return None, []
+        return None, [], None
+
+    tokenizer_obj = None
+    token_counts = {}
+    if match_token_count:
+        tokenizer_obj = tokenizer if tokenizer is not None else _get_tokenizer(tokenizer_name)
+        for target in targets:
+            token_counts[target.token.i] = _token_count(tokenizer_obj, target.token.text)
 
     pool = []
     for lemma in (lemma_pool or []):
@@ -2140,7 +2329,7 @@ def verb_swap_from_pool(
             continue
         pool.append(norm)
     if not pool:
-        return None, []
+        return None, [], None
 
     toks = [t.text for t in doc]
     swaps = []
@@ -2148,9 +2337,9 @@ def verb_swap_from_pool(
     chosen_by_key = {}
     for target in targets:
         if _frame_requires_prep(target.frame_kind) and target.prep_token is None:
-            return None, []
+            return None, [], None
         if _frame_requires_particle(target.frame_kind) and target.particle_token is None:
-            return None, []
+            return None, [], None
 
         key = (target.lemma or "").strip().lower()
         tied = chosen_by_key.get(key)
@@ -2158,20 +2347,30 @@ def verb_swap_from_pool(
         if tied:
             form = _inflect_pool_lemma(tied, target.tag)
             if form:
+                if match_token_count:
+                    if _token_count(tokenizer_obj, form) != token_counts.get(target.token.i, 0):
+                        return None, [], "verb_no_token_match"
                 chosen = (tied, form)
             else:
-                return None, []
+                return None, [], None
 
         if not chosen:
             pool_order = list(pool)
             rng.shuffle(pool_order)
+            saw_token_mismatch = False
             for lemma in pool_order:
                 form = _inflect_pool_lemma(lemma, target.tag)
                 if form:
+                    if match_token_count:
+                        if _token_count(tokenizer_obj, form) != token_counts.get(target.token.i, 0):
+                            saw_token_mismatch = True
+                            continue
                     chosen = (lemma, form)
                     break
         if not chosen:
-            return None, []
+            if match_token_count and saw_token_mismatch:
+                return None, [], "verb_no_token_match"
+            return None, [], None
         lemma, form = chosen
         chosen_by_key[key] = lemma
         toks[target.token.i] = _match_casing(target.token.text, form)
@@ -2204,4 +2403,4 @@ def verb_swap_from_pool(
     text = _detokenize(toks)
     if text:
         text = text[0].upper() + text[1:]
-    return text, swaps
+    return text, swaps, None

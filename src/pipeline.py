@@ -56,6 +56,17 @@ def _print_progress(done, total, start_time, last_update, width=30):
     return now
 
 
+def _normalize_blimp_field(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    val = str(value).strip()
+    if not val:
+        return None
+    if val == "syntax_semantics":
+        return "syntax/semantics"
+    return val
+
+
 _ACRONYM_VOWELS = set("aeiou")
 _VULGAR_NOUNS = {
     "asshole",
@@ -581,7 +592,9 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                 zipf_weighted_sampling: bool = False,
                 zipf_temp: float = 1.0,
                 spacy_n_process: int = 1,
-                spacy_batch_size: int = 128):
+                spacy_batch_size: int = 128,
+                match_token_count: bool = False,
+                swap_tokenizer: Optional[str] = None):
     if record_limit is not None:
         try:
             record_limit = max(0, int(record_limit))
@@ -638,6 +651,10 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
         "prefer_verb_lemmas": True,
         "min_verb_share": float(verb_min_verb_share),
         "verbiness_lexicon": verbiness_lexicon,
+    }
+    token_match_kwargs = {
+        "match_token_count": match_token_count,
+        "tokenizer_name": swap_tokenizer,
     }
 
     def _take_first(dataset, n: int):
@@ -837,6 +854,12 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                     if reason and reason not in swap_failures:
                         swap_failures.append(reason)
 
+                def _note_swap_reason(reason: Optional[str]) -> bool:
+                    if reason:
+                        _note_swap_failure(reason)
+                        return True
+                    return False
+
                 # Stage 0: verb swaps
                 # Skip verb swaps for irregular-forms tasks (where the target
                 # contrast is morphological).
@@ -848,6 +871,7 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                     verb_attempted = False
                     verb_candidates_present = False
                     verb_matches_present = False
+                    verb_failure_reported = False
 
                     def _find_passive_head(doc):
                         for tok in doc:
@@ -895,7 +919,7 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                 "particle_i": None,
                                 "that_clause": False,
                             }]
-                            g_verb_variant, g_verb_swaps = verb_swap_all(
+                            g_verb_variant, g_verb_swaps, g_verb_reason = verb_swap_all(
                                 gdoc_working,
                                 verb_inventory_obj,
                                 transitivity_inventory=verb_inventory_transitivity,
@@ -908,9 +932,12 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                 **verb_sampling_kwargs,
                                 rng=rng_good,
                                 forced_targets=g_forced,
+                                **token_match_kwargs,
                             )
                             verb_attempted = True
-                            b_verb_variant, b_verb_swaps = verb_swap_all(
+                            if _note_swap_reason(g_verb_reason):
+                                verb_failure_reported = True
+                            b_verb_variant, b_verb_swaps, b_verb_reason = verb_swap_all(
                                 bdoc_working,
                                 verb_inventory_obj,
                                 transitivity_inventory=verb_inventory_transitivity,
@@ -923,8 +950,11 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                 **verb_sampling_kwargs,
                                 rng=rng_bad,
                                 forced_targets=b_forced,
+                                **token_match_kwargs,
                             )
                             verb_attempted = True
+                            if _note_swap_reason(b_verb_reason):
+                                verb_failure_reported = True
                             if not (
                                 g_verb_variant
                                 and b_verb_variant
@@ -1130,7 +1160,7 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
 
                             # Swap verbs that should stay identical across good/bad using the inventory.
                             if same_g_specs:
-                                g_same_text, g_same_swaps = verb_swap_all(
+                                g_same_text, g_same_swaps, g_same_reason = verb_swap_all(
                                     g_curr_doc,
                                     verb_inventory_obj,
                                     transitivity_inventory=verb_inventory_transitivity,
@@ -1143,8 +1173,11 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                     **verb_sampling_kwargs,
                                     rng=rng_verbs,
                                     forced_targets=same_g_specs,
+                                    **token_match_kwargs,
                                 )
                                 verb_attempted = True
+                                if _note_swap_reason(g_same_reason):
+                                    verb_failure_reported = True
                                 if not (g_same_text and g_same_swaps and len(g_same_swaps) == len(same_g_specs)):
                                     swap_failed = True
                                 else:
@@ -1159,7 +1192,7 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                     if len(override_specs) != len(same_b_specs):
                                         swap_failed = True
                                     else:
-                                        b_same_text, b_same_swaps = verb_swap_all(
+                                        b_same_text, b_same_swaps, b_same_reason = verb_swap_all(
                                             b_curr_doc,
                                             verb_inventory_obj,
                                             transitivity_inventory=verb_inventory_transitivity,
@@ -1173,8 +1206,11 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                             rng=random.Random(pair_seed - 1),
                                             forced_targets=same_b_specs,
                                             override_specs=override_specs,
+                                            **token_match_kwargs,
                                         )
                                         verb_attempted = True
+                                        if _note_swap_reason(b_same_reason):
+                                            verb_failure_reported = True
                                         if not (
                                             b_same_text
                                             and b_same_swaps
@@ -1191,22 +1227,28 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
 
                             # Swap the differing raising/control verb only.
                             if not swap_failed and diff_g_specs:
-                                g_verb_variant, g_verb_swaps_diff = verb_swap_from_pool(
+                                g_verb_variant, g_verb_swaps_diff, g_verb_reason = verb_swap_from_pool(
                                     g_curr_doc,
                                     raising_pool,
                                     forced_targets=diff_g_specs,
                                     rng=rng_verbs,
+                                    **token_match_kwargs,
                                 )
                                 verb_attempted = True
+                                if _note_swap_reason(g_verb_reason):
+                                    verb_failure_reported = True
                                 b_verb_variant = None
                                 if g_verb_variant and g_verb_swaps_diff and len(diff_b_specs) == len(g_verb_swaps_diff):
-                                    b_verb_variant, b_verb_swaps_diff = verb_swap_from_pool(
+                                    b_verb_variant, b_verb_swaps_diff, b_verb_reason = verb_swap_from_pool(
                                         b_curr_doc,
                                         control_pool,
                                         forced_targets=diff_b_specs,
                                         rng=random.Random(pair_seed - 2 if not matched_by_identity else pair_seed - 1),
+                                        **token_match_kwargs,
                                     )
                                     verb_attempted = True
+                                    if _note_swap_reason(b_verb_reason):
+                                        verb_failure_reported = True
                                     if b_verb_variant and b_verb_swaps_diff:
                                         g_curr_text = g_verb_variant
                                         b_curr_text = b_verb_variant
@@ -1228,7 +1270,7 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                             # generic inventory-driven verb swap so we still get a rare
                             # variant when possible.
                             if g_verb_variant is None or b_verb_variant is None:
-                                g_verb_variant, g_verb_swaps = verb_swap_all(
+                                g_verb_variant, g_verb_swaps, g_verb_reason = verb_swap_all(
                                     gdoc_working,
                                     verb_inventory_obj,
                                     transitivity_inventory=verb_inventory_transitivity,
@@ -1241,12 +1283,15 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                     **verb_sampling_kwargs,
                                     rng=rng_verbs,
                                     forced_targets=g_target_specs,
+                                    **token_match_kwargs,
                                 )
                                 verb_attempted = True
+                                if _note_swap_reason(g_verb_reason):
+                                    verb_failure_reported = True
                                 b_verb_variant = None
                                 if g_verb_variant and g_verb_swaps and len(b_target_specs) == len(g_verb_swaps):
                                     b_seed = pair_seed - 1 if matched_by_identity else pair_seed - 2
-                                    b_verb_variant, b_verb_swaps = verb_swap_all(
+                                    b_verb_variant, b_verb_swaps, b_verb_reason = verb_swap_all(
                                         bdoc_working,
                                         verb_inventory_obj,
                                         transitivity_inventory=verb_inventory_transitivity,
@@ -1259,8 +1304,11 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                         **verb_sampling_kwargs,
                                         rng=random.Random(b_seed),
                                         forced_targets=b_target_specs,
+                                        **token_match_kwargs,
                                     )
                                     verb_attempted = True
+                                    if _note_swap_reason(b_verb_reason):
+                                        verb_failure_reported = True
 
                             if not (
                                 g_verb_variant
@@ -1278,7 +1326,7 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                 gdoc_working = nlp(g_variant)
                                 bdoc_working = nlp(b_variant)
                         else:
-                            g_verb_variant, g_verb_swaps = verb_swap_all(
+                            g_verb_variant, g_verb_swaps, g_verb_reason = verb_swap_all(
                                 gdoc_working,
                                 verb_inventory_obj,
                                 transitivity_inventory=verb_inventory_transitivity,
@@ -1291,8 +1339,11 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                 **verb_sampling_kwargs,
                                 rng=rng_verbs,
                                 forced_targets=g_target_specs,
+                                **token_match_kwargs,
                             )
                             verb_attempted = True
+                            if _note_swap_reason(g_verb_reason):
+                                verb_failure_reported = True
                             b_verb_variant = None
                             if g_verb_variant and g_verb_swaps:
                                 override_specs = []
@@ -1312,7 +1363,7 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                             override_specs.append(None)
                                 if len(b_target_specs) == len(g_verb_swaps):
                                     b_seed = pair_seed - 1 if matched_by_identity else pair_seed - 2
-                                    b_verb_variant, b_verb_swaps = verb_swap_all(
+                                    b_verb_variant, b_verb_swaps, b_verb_reason = verb_swap_all(
                                         bdoc_working,
                                         verb_inventory_obj,
                                         transitivity_inventory=verb_inventory_transitivity,
@@ -1326,8 +1377,11 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                         rng=random.Random(b_seed),
                                         forced_targets=b_target_specs,
                                         override_specs=override_specs or None,
+                                        **token_match_kwargs,
                                     )
                                     verb_attempted = True
+                                    if _note_swap_reason(b_verb_reason):
+                                        verb_failure_reported = True
                             if not (
                                 g_verb_variant
                                 and b_verb_variant
@@ -1344,7 +1398,9 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                 gdoc_working = nlp(g_variant)
                                 bdoc_working = nlp(b_variant)
                     if not verb_changed:
-                        if verb_attempted:
+                        if verb_failure_reported:
+                            pass
+                        elif verb_attempted:
                             _note_swap_failure("verb_swap_failed")
                         elif verb_candidates_present:
                             _note_swap_failure("verb_no_matches")
@@ -1354,6 +1410,7 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                 # Stage 1: noun swaps
                 if do_noun_swaps:
                     noun_attempted = False
+                    noun_failure_reported = False
                     # Detect noun targets on the original parse so earlier swaps
                     # (e.g., verbs) don't change POS tags and get re-swapped.
                     g_verb_indices = {entry.get("i") for entry in g_verb_swaps or () if isinstance(entry, dict)}
@@ -1454,7 +1511,7 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                         "require_gender": require_gender,
                                     })
                         rng = random.Random(pair_seed)
-                        g_rare, g_swaps = noun_swap_all(
+                        g_rare, g_swaps, g_noun_reason = noun_swap_all(
                             gdoc_working, rare_pool,
                             noun_mode=noun_mode, k=k, zipf_thr=None, zipf_min=noun_zipf_min,
                             zipf_weighted=zipf_weighted_sampling,
@@ -1464,13 +1521,16 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                             rare_person_lemmas=rare_person_pool,
                             rare_gender_lemmas=rare_gender_map,
                             reflexive_subjects=g_reflexive_subjects,
+                            **token_match_kwargs,
                         )
                         noun_attempted = True
+                        if _note_swap_reason(g_noun_reason):
+                            noun_failure_reported = True
                         b_rare = None
                         if g_rare and g_swaps:
                             lemmas = [entry.get("lemma") for entry in g_swaps[:matched_count]]
                             if lemmas and all(lemma for lemma in lemmas):
-                                b_rare, b_swaps = noun_swap_all(
+                                b_rare, b_swaps, b_noun_reason = noun_swap_all(
                                     bdoc_working, rare_pool,
                                     noun_mode=noun_mode, k=k, zipf_thr=None, zipf_min=noun_zipf_min,
                                     zipf_weighted=zipf_weighted_sampling,
@@ -1482,8 +1542,11 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                     rare_gender_lemmas=rare_gender_map,
                                     override_lemmas=lemmas,
                                     reflexive_subjects=b_reflexive_subjects,
+                                    **token_match_kwargs,
                                 )
                                 noun_attempted = True
+                                if _note_swap_reason(b_noun_reason):
+                                    noun_failure_reported = True
                         if not (
                             g_rare
                             and b_rare
@@ -1529,7 +1592,7 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                         b_rare = None
 
                         if g_target_specs and b_target_specs:
-                            g_rare, g_swaps = noun_swap_all(
+                            g_rare, g_swaps, g_noun_reason = noun_swap_all(
                                 gdoc_working, rare_pool,
                                 noun_mode=noun_mode, k=k, zipf_thr=None, zipf_min=noun_zipf_min,
                                 zipf_weighted=zipf_weighted_sampling,
@@ -1539,11 +1602,14 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                 rare_person_lemmas=rare_person_pool,
                                 rare_gender_lemmas=rare_gender_map,
                                 reflexive_subjects=g_reflexive_subjects,
+                                **token_match_kwargs,
                             )
                             noun_attempted = True
+                            if _note_swap_reason(g_noun_reason):
+                                noun_failure_reported = True
                             b_rare = None
                             if g_rare and g_swaps:
-                                b_rare, b_swaps = noun_swap_all(
+                                b_rare, b_swaps, b_noun_reason = noun_swap_all(
                                     bdoc_working, rare_pool,
                                     noun_mode=noun_mode, k=k, zipf_thr=None, zipf_min=noun_zipf_min,
                                     zipf_weighted=zipf_weighted_sampling,
@@ -1554,8 +1620,11 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                     rare_person_lemmas=rare_person_pool,
                                     rare_gender_lemmas=rare_gender_map,
                                     reflexive_subjects=b_reflexive_subjects,
+                                    **token_match_kwargs,
                                 )
                                 noun_attempted = True
+                                if _note_swap_reason(b_noun_reason):
+                                    noun_failure_reported = True
                         if not (
                             g_rare
                             and b_rare
@@ -1574,7 +1643,9 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                             gdoc_working = nlp(g_variant)
                             bdoc_working = nlp(b_variant)
                     if not noun_changed:
-                        if noun_attempted:
+                        if noun_failure_reported:
+                            pass
+                        elif noun_attempted:
                             _note_swap_failure("noun_swap_failed")
                         elif noun_candidates_present:
                             _note_swap_failure("noun_no_matches")
@@ -1584,6 +1655,7 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                 # Stage 2: adjective swaps (operates on the noun-swapped text)
                 if do_adj_swaps and phenomenon != "irregular_forms":
                     adj_attempted = False
+                    adj_failure_reported = False
                     adj_good_pool = rare_adj_pool
                     adj_bad_pool = rare_adj_pool
                     allow_ellipsis_adj = phenomenon == "ellipsis" and cfg == "ellipsis_n_bar_2"
@@ -1726,19 +1798,22 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                             if same_pairs:
                                 g_specs_same = [{"i": gi, "tag": gt} for (gi, gt), _ in same_pairs]
                                 b_specs_same = [{"i": bi, "tag": bt} for _, (bi, bt) in same_pairs]
-                                g_same_text, g_same_swaps = adjective_swap_all(
-                                g_adj_doc_curr,
-                                adj_good_pool,
-                                adj_mode=adj_mode,
-                                k=k,
-                                zipf_thr=adj_zipf_thr,
-                                zipf_min=adj_zipf_min,
-                                zipf_weighted=zipf_weighted_sampling,
-                                zipf_temp=zipf_temp,
-                                rng=rng_adj,
-                                forced_targets=g_specs_same,
-                            )
+                                g_same_text, g_same_swaps, g_adj_reason = adjective_swap_all(
+                                    g_adj_doc_curr,
+                                    adj_good_pool,
+                                    adj_mode=adj_mode,
+                                    k=k,
+                                    zipf_thr=adj_zipf_thr,
+                                    zipf_min=adj_zipf_min,
+                                    zipf_weighted=zipf_weighted_sampling,
+                                    zipf_temp=zipf_temp,
+                                    rng=rng_adj,
+                                    forced_targets=g_specs_same,
+                                    **token_match_kwargs,
+                                )
                                 adj_attempted = True
+                                if _note_swap_reason(g_adj_reason):
+                                    adj_failure_reported = True
                                 if not (g_same_text and g_same_swaps and len(g_same_swaps) == len(g_specs_same)):
                                     swap_failed = True
                                 else:
@@ -1752,20 +1827,23 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                     if len(override_lemmas) != len(b_specs_same):
                                         swap_failed = True
                                     else:
-                                        b_same_text, b_same_swaps = adjective_swap_all(
-                                        b_adj_doc_curr,
-                                        adj_bad_pool,
-                                        adj_mode=adj_mode,
-                                        k=k,
-                                        zipf_thr=adj_zipf_thr,
-                                        zipf_min=adj_zipf_min,
-                                        zipf_weighted=zipf_weighted_sampling,
-                                        zipf_temp=zipf_temp,
-                                        rng=random.Random(pair_seed + 1),
-                                        forced_targets=b_specs_same,
-                                        override_lemmas=override_lemmas,
+                                        b_same_text, b_same_swaps, b_adj_reason = adjective_swap_all(
+                                            b_adj_doc_curr,
+                                            adj_bad_pool,
+                                            adj_mode=adj_mode,
+                                            k=k,
+                                            zipf_thr=adj_zipf_thr,
+                                            zipf_min=adj_zipf_min,
+                                            zipf_weighted=zipf_weighted_sampling,
+                                            zipf_temp=zipf_temp,
+                                            rng=random.Random(pair_seed + 1),
+                                            forced_targets=b_specs_same,
+                                            override_lemmas=override_lemmas,
+                                            **token_match_kwargs,
                                         )
                                         adj_attempted = True
+                                        if _note_swap_reason(b_adj_reason):
+                                            adj_failure_reported = True
                                         if not (
                                             b_same_text
                                             and b_same_swaps
@@ -1783,7 +1861,7 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                             if not swap_failed and diff_pairs:
                                 g_specs_diff = [{"i": gi, "tag": gt} for (gi, gt), _ in diff_pairs]
                                 b_specs_diff = [{"i": bi, "tag": bt} for _, (bi, bt) in diff_pairs]
-                                g_diff_text, g_diff_swaps = adjective_swap_all(
+                                g_diff_text, g_diff_swaps, g_adj_reason = adjective_swap_all(
                                     g_adj_doc_curr,
                                     adj_good_pool,
                                     adj_mode=adj_mode,
@@ -1794,11 +1872,14 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                     zipf_temp=zipf_temp,
                                     rng=rng_adj,
                                     forced_targets=g_specs_diff,
+                                    **token_match_kwargs,
                                 )
                                 adj_attempted = True
+                                if _note_swap_reason(g_adj_reason):
+                                    adj_failure_reported = True
                                 b_diff_text, b_diff_swaps = None, None
                                 if g_diff_text and g_diff_swaps and len(g_diff_swaps) == len(g_specs_diff):
-                                    b_diff_text, b_diff_swaps = adjective_swap_all(
+                                    b_diff_text, b_diff_swaps, b_adj_reason = adjective_swap_all(
                                         b_adj_doc_curr,
                                         adj_bad_pool,
                                         adj_mode=adj_mode,
@@ -1809,8 +1890,11 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                         zipf_temp=zipf_temp,
                                         rng=random.Random(pair_seed + 2),
                                         forced_targets=b_specs_diff,
+                                        **token_match_kwargs,
                                     )
                                     adj_attempted = True
+                                    if _note_swap_reason(b_adj_reason):
+                                        adj_failure_reported = True
                                 if not (
                                     g_diff_text
                                     and b_diff_text
@@ -1834,7 +1918,7 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                         else:
                             g_target_specs = [{"i": g_idx, "tag": g_tag} for (g_idx, g_tag), _ in adj_matches]
                             b_target_specs = [{"i": b_idx, "tag": b_tag} for _, (b_idx, b_tag) in adj_matches]
-                            g_adj_variant, g_adj_swaps = adjective_swap_all(
+                            g_adj_variant, g_adj_swaps, g_adj_reason = adjective_swap_all(
                                 gdoc_adj,
                                 adj_good_pool,
                                 adj_mode=adj_mode,
@@ -1845,13 +1929,16 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                 zipf_temp=zipf_temp,
                                 rng=rng_adj,
                                 forced_targets=g_target_specs,
+                                **token_match_kwargs,
                             )
                             adj_attempted = True
+                            if _note_swap_reason(g_adj_reason):
+                                adj_failure_reported = True
                             b_adj_variant = None
                             if g_adj_variant and g_adj_swaps:
                                 adj_lemmas = [entry.get("lemma") for entry in g_adj_swaps]
                                 if adj_lemmas and all(lemma for lemma in adj_lemmas):
-                                        b_adj_variant, b_adj_swaps = adjective_swap_all(
+                                    b_adj_variant, b_adj_swaps, b_adj_reason = adjective_swap_all(
                                         bdoc_adj,
                                         adj_bad_pool,
                                         adj_mode=adj_mode,
@@ -1863,8 +1950,11 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                         rng=random.Random(pair_seed + 1),
                                         forced_targets=b_target_specs,
                                         override_lemmas=adj_lemmas,
-                                        )
-                                        adj_attempted = True
+                                        **token_match_kwargs,
+                                    )
+                                    adj_attempted = True
+                                    if _note_swap_reason(b_adj_reason):
+                                        adj_failure_reported = True
                             if not (
                                 g_adj_variant
                                 and b_adj_variant
@@ -1879,7 +1969,9 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                                 b_variant = b_adj_variant
                                 adj_changed = True
                     if not adj_changed:
-                        if adj_attempted:
+                        if adj_failure_reported:
+                            pass
+                        elif adj_attempted:
                             _note_swap_failure("adj_swap_failed")
                         elif adj_candidates_present:
                             _note_swap_failure("adj_no_matches")
@@ -1912,10 +2004,12 @@ def build_pilot(tier_cfg_path, becl_path, quant_cfg_path, out_path,
                     adj_changed = False
                     swap_failed_reason = "pair_collapsed"
 
+                blimp_field = _normalize_blimp_field(r.get("field"))
                 record = {
                     "group": group_name,
                     "phenomenon": phenomenon,
                     "subtask": cfg,
+                    "field": blimp_field,
                     "idx": i,
                     "good_original": g,
                     "bad_original": b,
